@@ -1,0 +1,170 @@
+---
+title: Introduction
+description: 'Unified governance plane for AI agents with pre-execution authorization, policy-as-code, and tamper-evident audit trail.'
+---
+
+## What is Faramesh?
+
+Faramesh is a unified governance plane for AI agents that provides **pre-execution authorization**, **policy-as-code**, and a **tamper-evident audit trail**. It ensures that every AI agent action is evaluated against your policies before execution—giving you control, compliance, and confidence.
+
+<CardGroup cols={3}>
+  <Card title="Pre-execution Control" icon="shield-check">
+    Every action is evaluated before it executes. PERMIT, DENY, or DEFER with human-in-the-loop approval.
+  </Card>
+  <Card title="Policy-as-Code" icon="file-code">
+    Write governance rules in YAML with type-safe expressions. Validate in CI, version in Git.
+  </Card>
+  <Card title="Tamper-Evident Audit" icon="link">
+    Every decision is recorded in a cryptographic chain (DPR). Verify integrity with SHA256 checksums.
+  </Card>
+</CardGroup>
+
+## The Architecture Principle
+
+Faramesh follows the same architecture pattern as every successful infrastructure control plane—Terraform, Vault, Datadog, OPA:
+
+**Unified core + thin adapters**
+
+```
+┌──────────────────────── FARAMESH INVARIANT CORE ────────────────────────┐
+│  Policy Engine │ DPR Chain │ Session State │ DEFER Workflow │ Cloud     │
+│  (YAML+expr)   │ (WAL-first│               │ (channel park) │ Platform  │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │ CanonicalActionRequest + DPR write
+                                 │ (same format regardless of adapter)
+┌────────────────────────────────▼────────────────────────────────────────┐
+│                  ADAPTER STACK (auto-selected per environment)           │
+│                                                                          │
+│  A1: SDK Shim          A2: Local Daemon       A3: Sidecar + Proxy       │
+│  Python/JS/Go/TS       Unix socket + broker   Transparent HTTP/gRPC     │
+│  <60 sec on-ramp       Works everywhere       Network isolation         │
+│                                                                          │
+│  A4: Serverless        A5: MCP Gateway        A6: eBPF (optional)      │
+│  Lambda/Cloud Run      Faramesh IS the MCP    Kernel-level on Linux     │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+A developer who writes a Faramesh policy for their notebook has already learned everything needed to govern their production Kubernetes fleet. **Only the adapter changes**—and `faramesh init` selects it automatically.
+
+## Key Features
+
+### 1. Three Decision Modes
+
+- **PERMIT**: Action allowed, executes immediately
+- **DENY**: Action blocked before execution  
+- **DEFER**: Action paused pending human approval (human-in-the-loop)
+
+### 2. The WAL Ordering Invariant
+
+Every governance decision has a durable audit record **before** it is returned to the caller. No execution without an audit record—under any failure mode.
+
+```
+CanonicalActionRequest
+ │
+ ├─[1]  Kill switch check      atomic.Bool per agent_id — nanoseconds
+ ├─[2]  Phase check            tool visible in current workflow phase?
+ ├─[3]  Pre-execution scanners shell, secret, PII — parallel goroutines
+ ├─[4]  Session state read     sync.Map counters + ring buffer
+ ├─[5]  History ring read      last N calls within T seconds
+ ├─[6]  External selector fetch lazy, parallel, cached, timeout-bounded
+ ├─[7]  Policy evaluation      expr-lang bytecode, first-match-wins, ~1μs/rule
+ ├─[8]  Decision               PERMIT | DENY | DEFER | SHADOW
+ ├─[9]  WAL write ──────────── fsync to local disk BEFORE returning decision
+ ├─[10] Async                  replicate to SQLite DPR, update session + history
+ └─[11] Return Decision        to adapter
+```
+
+If step 9 fails → DENY. If the process crashes between steps 9 and 10, the WAL replays on restart. **No gap in the audit chain is possible.**
+
+### 3. DPR Chain — Tamper-Evident Audit Trail
+
+Every decision is recorded in a per-agent chain. Each record includes:
+
+- `record_hash` — SHA256 of this record's canonical bytes
+- `prev_record_hash` — SHA256 of the previous record (linked list)  
+- `policy_version` — hash of the active policy at decision time
+- `args_structural_sig` — shape hash of arguments (never raw values)
+- `effect` — PERMIT / DENY / DEFER / SHADOW
+
+<Note>
+Verify chain integrity at any time:
+```bash
+faramesh audit verify ~/.faramesh/faramesh.db
+# ✓ Chain integrity verified. 1,247 records, 0 violations.
+```
+</Note>
+
+### 4. Zero Infrastructure in Development
+
+The Python SDK auto-starts the Faramesh daemon on the first call. No separate setup required:
+
+```python
+from faramesh import govern
+
+governed_refund = govern(stripe_refund, policy='payment.yaml', agent_id='payment-bot')
+result = governed_refund(amount=100, currency='usd')  # Daemon starts automatically
+```
+
+### 5. Policy-as-Code with Type-Safe Expressions
+
+Policies are written in YAML with [expr-lang](https://github.com/expr-lang/expr) conditions—a Go-native, type-safe, sandboxed expression language. Rules compile to bytecode at load time and evaluate at ~1μs per rule.
+
+```yaml
+rules:
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold — requires finance approval
+```
+
+## The Faramesh Ecosystem
+
+Faramesh is a suite of standalone tools that work together:
+
+| Tool | Purpose |
+|------|------|
+| **Core** | Pre-execution policy engine, DPR audit chain, DEFER workflow |
+| **Tesseract** | Pre-governance observation—see what agents do before writing policies |
+| **Hub** | Open-source policy pack registry with community packs |
+| **Sverm** | Cross-agent behavioral analysis and swarm governance |
+| **CostShield** | Pre-execution cost governance—prevent runaway LLM/API spend |
+| **Supply Chain** | Cryptographic signing, SBOM, reproducible build verification |
+
+All tools connect via the **Mesh** protocol—when multiple tools run on the same machine, they discover each other automatically and exchange data through authenticated Unix domain sockets.
+
+## Open Source + Cloud Model
+
+Every tool ships with **all features included** in the open-source distribution. Advanced capabilities are plan-gated via Faramesh Cloud:
+
+| Tier | What You Get | Auth Required? |
+|------|-------------|----------------|
+| **Community** | Full core functionality—policies, budgets, observation, signing, SBOM, delegation | No |
+| **Pro** | Cloud sync, rolling window budgets, cloud registry, cloud attestation | Yes (free account) |
+| **Team** | Anomaly detection, cost forecasting, private packs, cross-org swarm | Yes (Team plan) |
+| **Enterprise** | Fleet management, compliance exports, org-wide policies, fleet budgets | Yes (Enterprise plan) |
+
+<Tip>
+Login to Faramesh Cloud for advanced features:
+```bash
+faramesh auth login
+```
+</Tip>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    See Faramesh in action in 30 seconds
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Install Faramesh on your platform
+  </Card>
+  <Card title="Writing Policies" icon="file-code" href="/policy/writing-policies">
+    Learn how to write governance policies
+  </Card>
+  <Card title="Python SDK" icon="python" href="/guides/python-sdk">
+    Integrate with Python agents
+  </Card>
+</CardGroup>

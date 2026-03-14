@@ -1,0 +1,321 @@
+---
+title: "faramesh policy"
+description: "Policy lifecycle: validate, test, inspect, and manage policy files"
+---
+
+## Overview
+
+The `faramesh policy` command group provides tools for the complete policy lifecycle: validation, testing, inspection, diff analysis, replay, debugging, and coverage checking.
+
+## Commands
+
+### `faramesh policy validate`
+
+Validate a policy file's syntax, structure, and rule compilation.
+
+```bash
+faramesh policy validate policy.yaml
+```
+
+**What it does:**
+- Parses the policy YAML
+- Validates rule structure
+- Compiles all `when` conditions with expr-lang
+- Exits 0 on success, 1 on error
+
+**Example output:**
+```bash
+✓ policy.yaml  [v1.0]  3 rules  agent=payment-bot
+```
+
+**Use in CI:**
+```yaml
+- name: Validate policy
+  run: faramesh policy validate policies/production.yaml
+```
+
+<ParamField path="policy.yaml" type="string" required>
+  Path to the policy YAML file to validate.
+</ParamField>
+
+---
+
+### `faramesh policy inspect`
+
+Show a compiled policy summary with all rules.
+
+```bash
+faramesh policy inspect policy.yaml
+```
+
+**Example output:**
+```bash
+Policy: policy.yaml
+  version    : v1.0
+  agent-id   : payment-bot
+  fpl        : 1.0
+  rules      : 5
+  tools      : 12 declared
+  default    : permit
+
+Rules:
+  DENY     deny-destructive-shell           tool=shell/run  when="args[\"cmd\"] matches \"rm\\\\s+-[rf]\""
+  DEFER    defer-high-value-refund          tool=stripe/refund  when="args[\"amount\"] > vars[\"max_refund\"]"
+  DENY     deny-mass-email                  tool=send_email  when="len(args[\"recipients\"]) > 50"
+  PERMIT   allow-read-customer              tool=read_customer
+  PERMIT   allow-exchange-rate              tool=get_exchange_rate
+```
+
+<ParamField path="policy.yaml" type="string" required>
+  Path to the policy YAML file to inspect.
+</ParamField>
+
+---
+
+### `faramesh policy test`
+
+Dry-run a governance decision against a policy without a running daemon.
+
+```bash
+faramesh policy test policy.yaml --tool stripe/refund --args '{"amount":500}'
+```
+
+**Example output:**
+```bash
+  Tool:    stripe/refund
+  Effect:  DEFER
+  Rule:    defer-high-value-refund
+  Reason:  refund exceeds threshold — requires finance approval
+  Code:    HIGH_VALUE_REFUND
+```
+
+**Flags:**
+
+<ParamField path="--tool" type="string" required>
+  Tool ID to test (e.g., `stripe/refund`, `shell/exec`).
+</ParamField>
+
+<ParamField path="--args" type="string" default="{}">
+  Tool arguments as a JSON object. Example: `'{"amount":500,"currency":"usd"}'`.
+</ParamField>
+
+<ParamField path="--json" type="boolean" default="false">
+  Output the full decision as JSON instead of human-readable format.
+</ParamField>
+
+---
+
+### `faramesh policy diff`
+
+Compare two policy files and show which rules changed.
+
+```bash
+faramesh policy diff policies/v1.yaml policies/v2.yaml
+```
+
+**Example output:**
+```bash
+Policy diff
+  old: policies/v1.yaml  [v1.0]  5 rules
+  new: policies/v2.yaml  [v2.0]  6 rules
+
+  + allow-read-receipt                 PERMIT
+  ~ defer-high-value-refund            DEFER → PERMIT
+  - deny-mass-email                    DENY
+```
+
+<Note>
+  Use `faramesh policy diff` before deploying a policy update to see the impact on existing rules.
+</Note>
+
+---
+
+### `faramesh policy replay`
+
+Replay historical DPR records against a new policy to predict drift.
+
+```bash
+faramesh policy replay policies/v2.yaml data/dpr.db
+```
+
+**What it does:**
+- Loads DPR records from the audit database
+- Re-evaluates each record against the new policy
+- Shows which decisions would change
+
+**Example output:**
+```bash
+Policy Replay — drift prediction
+  policy : policies/v2.yaml [v2.0]
+  source : data/dpr.db  (500 records)
+
+  ⚠ 23 of 500 decisions (4.6%) would change:
+
+    stripe/refund          DEFER    → PERMIT    agent=payment-bot
+    send_email             DENY     → PERMIT    agent=marketing-bot
+    shell/run              DENY     → DENY      agent=ops-bot
+    ...
+```
+
+**Flags:**
+
+<ParamField path="--limit" type="number" default="500">
+  Maximum DPR records to replay.
+</ParamField>
+
+<ParamField path="--json" type="boolean" default="false">
+  Output the drift report as JSON.
+</ParamField>
+
+<Note>
+  This is the governance equivalent of `terraform plan` — see the impact of a policy change before deploying it.
+</Note>
+
+---
+
+### `faramesh policy debug`
+
+Show step-by-step rule evaluation for a specific tool call.
+
+```bash
+faramesh policy debug policy.yaml --tool stripe/refund --args '{"amount":500}'
+```
+
+**Example output:**
+```bash
+Policy Debug — rule-by-rule trace
+  policy : policy.yaml [v1.0]
+  tool   : stripe/refund
+  args   : {"amount":500}
+
+  Rule evaluation trace:
+
+  [0] deny-destructive-shell        SKIP  tool="shell/run" does not match "stripe/refund"
+  [1] defer-high-value-refund       ▶ DEFER  when="args[\"amount\"] > vars[\"max_refund\"]" → true
+  [2] deny-mass-email               SKIP  (earlier rule matched first)
+
+  Result: DEFER  (rule: defer-high-value-refund)
+```
+
+**Flags:**
+
+<ParamField path="--tool" type="string" required>
+  Tool ID to debug.
+</ParamField>
+
+<ParamField path="--args" type="string" default="{}">
+  Tool arguments as JSON.
+</ParamField>
+
+---
+
+### `faramesh policy cover`
+
+Analyze policy coverage: find tools without matching rules.
+
+```bash
+faramesh policy cover policy.yaml
+```
+
+**Example output:**
+```bash
+Policy Coverage Analysis
+  policy   : policy.yaml
+  rules    : 5
+  probes   : 23 tool IDs
+  default  : permit
+
+  ✓ 18 tools covered by explicit rules
+  ✗ 5 tools fall through to default_effect (permit):
+      http/post
+      file/delete
+      db/delete
+      aws/s3/put
+      slack/post
+
+  ℹ 1 rules matched no probed tools (may match unlisted tools):
+      allow-custom-integration
+```
+
+**Flags:**
+
+<ParamField path="--tools" type="string">
+  Comma-separated list of additional tool IDs to check (in addition to declared tools and synthetic probes).
+  Example: `--tools "stripe/refund,stripe/charge,shell/exec"`
+</ParamField>
+
+**Exit code:**
+- `0` if all tools are covered
+- `1` if any tools fall through to `default_effect`
+
+**Use in CI:**
+```bash
+# Fail CI if policy coverage is incomplete
+faramesh policy cover policy.yaml || exit 1
+```
+
+---
+
+## Policy File Structure
+
+A Faramesh policy file is a YAML document with this structure:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: my-agent
+default_effect: permit
+
+vars:
+  max_refund: 500
+  admin_email: "admin@example.com"
+
+rules:
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]"'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold — requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+```
+
+<ResponseField name="faramesh-version" type="string" required>
+  Policy schema version. Currently `1.0`.
+</ResponseField>
+
+<ResponseField name="agent-id" type="string" required>
+  Agent identifier. Used for DPR chain tracking.
+</ResponseField>
+
+<ResponseField name="default_effect" type="string" default="permit">
+  Default effect when no rule matches: `permit`, `deny`, or `defer`.
+</ResponseField>
+
+<ResponseField name="vars" type="object">
+  Policy variables accessible in rule conditions via `vars["key"]`.
+</ResponseField>
+
+<ResponseField name="rules" type="array" required>
+  Array of rule objects. Each rule has:
+  - `id` (string, required): Unique rule identifier
+  - `match` (object, required): Match conditions
+    - `tool` (string): Tool ID or glob pattern (e.g., `stripe/*`)
+    - `when` (string): expr-lang condition
+  - `effect` (string, required): `permit`, `deny`, `defer`, or `shadow`
+  - `reason` (string): Human-readable reason
+  - `reason_code` (string): Machine-readable reason code
+</ResponseField>
+
+## Related Commands
+
+- [`faramesh serve`](/cli/serve) — Start the daemon with a validated policy
+- [`faramesh audit tail`](/cli/audit) — Stream live decisions
+- [`faramesh init`](/cli/init) — Generate a policy skeleton

@@ -1,97 +1,101 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Unified Governance for AI Agents"
+description: "Pre-execution authorization, policy-as-code, and tamper-evident audit trail for AI agents"
 ---
 
-## Setting up
+<div className="bg-gradient-to-r from-[#8434f4] to-[#5C4FFF] text-white p-8 rounded-lg mb-8">
+  <h1 className="text-4xl font-bold mb-4">Faramesh</h1>
+  <p className="text-xl mb-6">Unified governance plane for AI agents</p>
+  <p className="text-lg opacity-90">Pre-execution authorization · Policy-as-code · Tamper-evident audit trail</p>
+</div>
 
-Get your documentation site up and running in minutes.
+## See it work in 30 seconds
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+```bash
+# macOS / Linux with Homebrew
+brew install faramesh/tap/faramesh
 
-## Make it yours
+# or: curl -fsSL https://raw.githubusercontent.com/faramesh/faramesh-core/main/install.sh | sh
 
-Design a docs site that looks great and empowers your users.
+faramesh demo
+```
 
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<Note>Zero config. Zero infrastructure. PERMIT/DENY/DEFER in under 3 seconds.</Note>
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Policy-as-Code" icon="file-code" href="/policy/writing-policies">
+    Define governance rules in YAML with expr-lang expressions
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Pre-execution Control" icon="shield-check" href="/concepts/policy-engine">
+    PERMIT, DENY, or DEFER actions before they execute
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Tamper-evident Audit" icon="lock" href="/concepts/dpr-chain">
+    Every decision recorded in a cryptographic DPR chain
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Human-in-the-Loop" icon="user-check" href="/concepts/defer-workflow">
+    DEFER workflow parks calls for human approval
   </Card>
-</Columns>
+  <Card title="Multiple Adapters" icon="puzzle-piece" href="/concepts/adapters">
+    SDK, daemon, sidecar, serverless, MCP, eBPF modes
+  </Card>
+  <Card title="Multi-agent Governance" icon="users" href="/advanced/multi-agent">
+    Session management and cross-agent coordination
+  </Card>
+</CardGroup>
 
-## Create beautiful pages
+## Quick Links
 
-Everything you need to create world-class documentation.
+<CardGroup cols={3}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get started in 5 minutes
+  </Card>
+  <Card title="Python SDK" icon="python" href="/guides/python-sdk">
+    Integrate with govern()
+  </Card>
+  <Card title="CLI Reference" icon="terminal" href="/cli/demo">
+    Command line tools
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Architecture Principle
 
-## Need inspiration?
+Every successful infrastructure control plane — Terraform, Vault, Datadog, OPA — was built on one architecture decision: **unified core + thin adapters**. Faramesh follows the same model.
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Info>
+A developer who writes a Faramesh policy for their notebook has already learned everything needed to govern their production Kubernetes fleet. Only the adapter changes — and `faramesh init` selects it automatically.
+</Info>
+
+## The Governance Pipeline
+
+```
+CanonicalActionRequest
+ │
+ ├─[1]  Kill switch check      atomic.Bool per agent_id — nanoseconds
+ ├─[2]  Phase check            tool visible in current workflow phase?
+ ├─[3]  Pre-execution scanners shell, secret, PII — parallel goroutines
+ ├─[4]  Session state read     sync.Map counters + ring buffer
+ ├─[5]  History ring read      last N calls within T seconds
+ ├─[6]  External selector fetch lazy, parallel, cached, timeout-bounded
+ ├─[7]  Policy evaluation      expr-lang bytecode, first-match-wins, ~1μs/rule
+ ├─[8]  Decision               PERMIT | DENY | DEFER | SHADOW
+ ├─[9]  WAL write ──────────── fsync to local disk BEFORE returning decision
+ ├─[10] Async                  replicate to SQLite DPR, update session + history
+ └─[11] Return Decision        to adapter
+```
+
+<Warning>
+If step 9 fails → DENY. If the process crashes between steps 9 and 10, the WAL replays on restart. No gap in the audit chain is possible.
+</Warning>
+
+## Community
+
+<CardGroup cols={2}>
+  <Card title="GitHub" icon="github" href="https://github.com/faramesh/faramesh-core">
+    View source code and contribute
+  </Card>
+  <Card title="Issues" icon="circle-exclamation" href="https://github.com/faramesh/faramesh-core/issues">
+    Report bugs or request features
+  </Card>
+</CardGroup>

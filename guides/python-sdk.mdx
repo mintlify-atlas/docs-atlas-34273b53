@@ -1,0 +1,389 @@
+---
+title: Python SDK
+description: Govern Python agents with the Faramesh decorator — type-safe, Pydantic-friendly, auto-starting
+---
+
+The Faramesh Python SDK (Adapter A1 — SDK Shim) wraps any Python callable with pre-execution governance. Zero infrastructure in development mode — the daemon auto-starts on the first call.
+
+## Installation
+
+```bash
+pip install faramesh
+```
+
+## Quick Start
+
+```python
+from faramesh import govern
+
+def stripe_refund(amount: float, currency: str) -> str:
+    """Refund a charge via Stripe."""
+    # Your refund logic here
+    return f"Refunded {amount} {currency}"
+
+governed_refund = govern(
+    stripe_refund,
+    policy='payment.yaml',
+    agent_id='payment-bot'
+)
+
+try:
+    result = governed_refund(amount=100, currency='usd')
+    print(result)  # Executes if PERMIT
+except DenyError as e:
+    print(f"DENY: {e.reason}")
+except DeferredError as e:
+    print(f"DEFER: approve with: faramesh agent approve {e.defer_token}")
+```
+
+## How It Works
+
+<Steps>
+
+<Step title="Wrap your function">
+The `govern()` decorator wraps any callable. It preserves:
+- Type hints and `__annotations__`
+- Docstrings
+- Function name and module
+- Pydantic `BaseModel` parameters
+- LangChain `@tool` metadata
+
+```python
+from faramesh import govern
+
+governed_tool = govern(
+    my_function,
+    policy='policy.yaml',
+    agent_id='my-agent'
+)
+```
+</Step>
+
+<Step title="Auto-start daemon">
+On the first call, `govern()` automatically starts the Faramesh daemon if it's not running (development mode). In production, run the daemon separately:
+
+```bash
+faramesh serve --policy policy.yaml
+```
+</Step>
+
+<Step title="Governance pipeline">
+Every function call goes through the governance pipeline:
+1. Arguments are serialized to JSON-safe format
+2. Sent to daemon via Unix socket (`/tmp/faramesh.sock`)
+3. Policy evaluated, DPR record written
+4. Decision returned: `PERMIT`, `DENY`, `DEFER`, or `SHADOW`
+</Step>
+
+<Step title="Execute or raise">
+- **PERMIT/SHADOW**: Function executes normally
+- **DENY**: Raises `DenyError` immediately
+- **DEFER**: Blocks, polls every 2 seconds until approved/denied/timeout (default: 5 minutes)
+</Step>
+
+</Steps>
+
+## API Reference
+
+### `govern()`
+
+```python
+def govern(
+    fn: Callable,
+    *,
+    policy: str = "policy.yaml",
+    agent_id: str | None = None,
+    tool_id: str | None = None,
+    socket_path: str = "/tmp/faramesh.sock",
+    auto_start: bool = True,
+) -> Callable:
+```
+
+**Parameters:**
+
+- `fn` — The function to govern
+- `policy` — Path to the policy YAML file (default: `"policy.yaml"`)
+- `agent_id` — Agent identity. Defaults to `fn.__module__ + "." + fn.__qualname__`
+- `tool_id` — Tool identifier used in policy rules. Defaults to `fn.__name__`
+- `socket_path` — Daemon Unix socket path (default: `"/tmp/faramesh.sock"`)
+- `auto_start` — If `True`, auto-start the daemon on first call (default: `True`)
+
+**Returns:** A wrapped function with the same signature as the original.
+
+### Exceptions
+
+#### `DenyError`
+
+Raised when the policy denies a tool call.
+
+```python
+class DenyError(FarameshError):
+    tool_id: str
+    rule_id: str | None  # None for default deny
+    reason_code: str     # Machine-readable code
+    reason: str          # Human-readable explanation
+```
+
+**Example:**
+
+```python
+try:
+    governed_tool(amount=10000)
+except DenyError as e:
+    print(f"Rule: {e.rule_id}")
+    print(f"Code: {e.reason_code}")
+    print(f"Reason: {e.reason}")
+```
+
+#### `DeferredError`
+
+Raised when a deferred action times out or is explicitly denied by the approver.
+
+```python
+class DeferredError(FarameshError):
+    tool_id: str
+    defer_token: str  # Token for approval: faramesh agent approve <token>
+    reason: str
+    expired: bool     # True if timeout, False if denied
+```
+
+**Example:**
+
+```python
+try:
+    governed_tool(amount=10000)
+except DeferredError as e:
+    if e.expired:
+        print(f"DEFER timed out. Token: {e.defer_token}")
+    else:
+        print(f"DEFER denied. Token: {e.defer_token}")
+    print(f"Approve: faramesh agent approve {e.defer_token}")
+```
+
+## Type Hints and Pydantic Models
+
+The SDK preserves type hints and automatically serializes Pydantic models.
+
+```python
+from pydantic import BaseModel
+from faramesh import govern
+
+class RefundRequest(BaseModel):
+    amount: float
+    currency: str
+    customer_id: str
+
+def process_refund(request: RefundRequest) -> str:
+    """Process a refund request."""
+    return f"Refunded {request.amount} {request.currency}"
+
+governed_refund = govern(process_refund, policy='payment.yaml')
+
+# Pydantic model is automatically serialized via .model_dump() (v2) or .dict() (v1)
+req = RefundRequest(amount=100.0, currency='usd', customer_id='cust_123')
+result = governed_refund(req)
+```
+
+<Note>
+The SDK detects Pydantic v1 (`.dict()`) and v2 (`.model_dump()`) automatically.
+</Note>
+
+## Advanced Usage
+
+### Custom Agent and Tool IDs
+
+```python
+governed_tool = govern(
+    my_function,
+    agent_id='payment-bot',
+    tool_id='stripe/refund',  # Used in policy rules
+    policy='payment.yaml'
+)
+```
+
+### Manual Daemon Connection
+
+Disable auto-start for production:
+
+```python
+governed_tool = govern(
+    my_function,
+    policy='policy.yaml',
+    auto_start=False  # Requires daemon to be running
+)
+```
+
+Start the daemon manually:
+
+```bash
+faramesh serve --policy payment.yaml --socket /tmp/faramesh.sock
+```
+
+### Session Tracking
+
+The SDK automatically generates a session ID per process. All governed calls from the same process share a session ID, enabling:
+- Rate limiting across calls
+- Session-scoped budgets
+- Multi-call pattern detection
+
+## Error Handling Patterns
+
+### Graceful Degradation
+
+```python
+from faramesh import govern, DenyError, DeferredError
+
+def safe_operation(amount: float):
+    try:
+        return governed_refund(amount=amount, currency='usd')
+    except DenyError as e:
+        # Log denial and return fallback
+        logger.warning(f"Refund denied: {e.reason_code}")
+        return None
+    except DeferredError as e:
+        # Queue for manual review
+        queue_for_review(e.defer_token, amount)
+        return {"status": "pending", "token": e.defer_token}
+```
+
+### Retry on DEFER
+
+```python
+import time
+from faramesh import govern, DeferredError
+
+def retry_on_defer(fn, *args, **kwargs):
+    while True:
+        try:
+            return fn(*args, **kwargs)
+        except DeferredError as e:
+            print(f"Waiting for approval: {e.defer_token}")
+            time.sleep(10)  # SDK already polls internally
+```
+
+## Integration with Logging
+
+```python
+import logging
+from faramesh import govern, DenyError, DeferredError
+
+logger = logging.getLogger(__name__)
+
+def logged_tool(amount: float):
+    try:
+        result = governed_refund(amount=amount, currency='usd')
+        logger.info(f"Refund permitted: {amount}")
+        return result
+    except DenyError as e:
+        logger.warning(
+            f"Refund denied",
+            extra={
+                "rule_id": e.rule_id,
+                "reason_code": e.reason_code,
+                "amount": amount
+            }
+        )
+        raise
+    except DeferredError as e:
+        logger.info(
+            f"Refund deferred",
+            extra={
+                "defer_token": e.defer_token,
+                "amount": amount
+            }
+        )
+        raise
+```
+
+## Production Deployment
+
+<Steps>
+
+<Step title="Run daemon as a service">
+```bash
+# systemd service
+[Unit]
+Description=Faramesh Governance Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/faramesh serve --policy /etc/faramesh/policy.yaml
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+</Step>
+
+<Step title="Disable auto-start in code">
+```python
+governed_tool = govern(
+    my_function,
+    policy='/etc/faramesh/policy.yaml',
+    auto_start=False  # Production: daemon runs as service
+)
+```
+</Step>
+
+<Step title="Monitor with audit tail">
+```bash
+faramesh audit tail --agent payment-bot
+```
+</Step>
+
+</Steps>
+
+## Troubleshooting
+
+### DaemonError: Socket not found
+
+```python
+DaemonError: Daemon socket not found at /tmp/faramesh.sock.
+Is the daemon running? Run: faramesh serve --policy policy.yaml
+```
+
+**Solution:** Start the daemon or enable `auto_start=True`.
+
+### Connection Refused
+
+```python
+DaemonError: Connection refused at /tmp/faramesh.sock.
+```
+
+**Solution:** Check that the daemon is running and the socket path matches.
+
+### Timeout on DEFER
+
+Default DEFER timeout is 5 minutes. The SDK polls every 2 seconds.
+
+**Customize timeout:**
+
+The timeout is controlled by the daemon policy, not the SDK. To change it, update your policy:
+
+```yaml
+rules:
+  - id: defer-high-value
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 500'
+    effect: defer
+    defer_timeout: 600  # 10 minutes
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="LangChain Integration" icon="link" href="/guides/langchain">
+    Use govern() with LangChain @tool decorator
+  </Card>
+  <Card title="Daemon Mode" icon="server" href="/guides/daemon-mode">
+    Run the daemon as a persistent service
+  </Card>
+  <Card title="Policy Language" icon="file-code" href="/policy/writing-policies">
+    Write policy rules with YAML + expr
+  </Card>
+  <Card title="CLI Usage" icon="terminal" href="/guides/cli-usage">
+    Approve DEFERs, validate policies, stream audit logs
+  </Card>
+</CardGroup>

@@ -1,0 +1,376 @@
+---
+title: Installation
+description: 'Install Faramesh on macOS, Linux, Windows, or Docker. Includes Python SDK installation and verification steps.'
+---
+
+## Install the Faramesh CLI
+
+Faramesh provides pre-built binaries for macOS, Linux, and Windows. Choose the installation method that works best for your environment.
+
+<Tabs>
+  <Tab title="macOS / Linux">
+    ### Homebrew (Recommended)
+
+    The easiest way to install on macOS or Linux:
+
+    ```bash
+    brew install faramesh/tap/faramesh
+    ```
+
+    Update to the latest version:
+    ```bash
+    brew upgrade faramesh
+    ```
+
+    ---
+
+    ### Install Script
+
+    If you don't have Homebrew, use the install script:
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/faramesh/faramesh-core/main/install.sh | sh
+    ```
+
+    **What the script does:**
+    - Detects your OS (Linux/Darwin) and architecture (amd64/arm64)
+    - Downloads the latest release from GitHub
+    - Verifies the SHA256 checksum
+    - Installs to `/usr/local/bin` (or `~/.local/bin` if no sudo)
+
+    <Note>
+    The script requires `curl` or `wget`, and `sha256sum` or `shasum` for checksum verification.
+    </Note>
+
+    The installer will suggest adding `~/.local/bin` to your `PATH` if needed:
+    ```bash
+    export PATH="$PATH:$HOME/.local/bin"
+    ```
+  </Tab>
+
+  <Tab title="Docker">
+    Run Faramesh in a Docker container:
+
+    ```bash
+    docker run --rm ghcr.io/faramesh/faramesh:latest demo
+    ```
+
+    To use your own policy file, mount it as a volume:
+    ```bash
+    docker run --rm \
+      -v $(pwd)/policy.yaml:/policy.yaml \
+      ghcr.io/faramesh/faramesh:latest serve --policy /policy.yaml
+    ```
+
+    <Info>
+    The Docker image includes the full Faramesh CLI with all adapters.
+    </Info>
+  </Tab>
+
+  <Tab title="Go Toolchain">
+    Compile from source using Go 1.25+:
+
+    ```bash
+    go install github.com/faramesh/faramesh-core/cmd/faramesh@latest
+    ```
+
+    <Warning>
+    This method compiles from source and takes ~5 minutes due to embedded SQLite (via `modernc.org/sqlite`).
+    </Warning>
+
+    Ensure `$GOPATH/bin` is in your `PATH`:
+    ```bash
+    export PATH="$PATH:$(go env GOPATH)/bin"
+    ```
+  </Tab>
+
+  <Tab title="Windows">
+    ### Direct Download
+
+    1. Go to the [latest release](https://github.com/faramesh/faramesh-core/releases/latest)
+    2. Download `faramesh-windows-amd64.exe`
+    3. Rename to `faramesh.exe`
+    4. Add to your `PATH`
+
+    **Add to PATH via PowerShell:**
+    ```powershell
+    $env:Path += ";C:\path\to\faramesh"
+    ```
+
+    **Permanent PATH update:**
+    ```powershell
+    [Environment]::SetEnvironmentVariable(
+        "Path",
+        $env:Path + ";C:\path\to\faramesh",
+        [EnvironmentVariableTarget]::User
+    )
+    ```
+
+    <Note>
+    Windows support is experimental. The daemon works, but some features (like eBPF) are Linux-only.
+    </Note>
+  </Tab>
+</Tabs>
+
+---
+
+## Install the Python SDK
+
+The Python SDK provides the `govern()` decorator for wrapping agent functions with governance.
+
+<CodeGroup>
+```bash pip
+pip install faramesh
+```
+
+```bash poetry
+poetry add faramesh
+```
+
+```bash pipenv
+pipenv install faramesh
+```
+
+```bash conda
+conda install -c conda-forge faramesh
+```
+</CodeGroup>
+
+**Requirements:**
+- Python 3.8+
+- Works on macOS, Linux, and Windows
+
+**What's included:**
+- `govern()` decorator for wrapping functions
+- `FarameshClient` for direct API access
+- Exception types: `DenyError`, `DeferredError`, `FarameshError`
+- Auto-daemon-start in development mode
+
+<Info>
+The Python SDK auto-starts the Faramesh daemon on the first `govern()` call. No separate installation or setup required for local development.
+</Info>
+
+---
+
+## Verify Installation
+
+<Steps>
+  <Step title="Check CLI version">
+    ```bash
+    faramesh --version
+    ```
+
+    Expected output:
+    ```
+    faramesh version 1.0.0 (commit abc1234, built 2026-03-01)
+    ```
+  </Step>
+
+  <Step title="Run the demo">
+    ```bash
+    faramesh demo
+    ```
+
+    You should see live governance decisions for a synthetic agent:
+    ```
+    Faramesh — Unified Agent Governance
+    Starting synthetic agent with demo policy...
+
+    [10:00:15] PERMIT  get_exchange_rate      from=USD to=SEK              latency=11ms
+    [10:00:17] DENY    shell/run              cmd="rm -rf /"               scanner=SCANNER_DENY  latency=0ms
+    ...
+    ```
+  </Step>
+
+  <Step title="Verify Python SDK">
+    ```bash
+    python -c "from faramesh import govern; print('Faramesh SDK installed ✓')"
+    ```
+
+    Expected output:
+    ```
+    Faramesh SDK installed ✓
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Troubleshooting
+
+### "faramesh: command not found"
+
+**Cause:** The install directory is not in your `PATH`.
+
+**Solution:** Add the install directory to your PATH:
+
+<CodeGroup>
+```bash Homebrew
+# Homebrew should do this automatically, but if not:
+export PATH="/usr/local/bin:$PATH"
+```
+
+```bash install.sh
+# If installed to ~/.local/bin:
+export PATH="$PATH:$HOME/.local/bin"
+
+# Add to ~/.bashrc or ~/.zshrc to make permanent:
+echo 'export PATH="$PATH:$HOME/.local/bin"' >> ~/.bashrc
+```
+
+```bash Go toolchain
+# Add GOPATH/bin to PATH:
+export PATH="$PATH:$(go env GOPATH)/bin"
+
+# Add to ~/.bashrc or ~/.zshrc:
+echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.bashrc
+```
+</CodeGroup>
+
+---
+
+### Python SDK: "DaemonError: could not connect to faramesh daemon"
+
+**Cause:** The daemon is not running, or the socket path is incorrect.
+
+**Solution 1:** Let the SDK auto-start the daemon (development mode):
+```python
+from faramesh import govern
+
+# auto_start=True by default
+governed_fn = govern(my_function, policy='policy.yaml', auto_start=True)
+```
+
+**Solution 2:** Manually start the daemon:
+```bash
+faramesh serve --policy policy.yaml
+```
+
+**Solution 3:** Check the socket path:
+```python
+# Default socket path is /tmp/faramesh.sock
+governed_fn = govern(my_function, policy='policy.yaml', socket_path='/tmp/faramesh.sock')
+```
+
+---
+
+### Docker: "permission denied while trying to connect to the Docker daemon socket"
+
+**Cause:** Your user is not in the `docker` group.
+
+**Solution:** Add your user to the `docker` group:
+```bash
+sudo usermod -aG docker $USER
+# Log out and log back in for the change to take effect
+```
+
+---
+
+### macOS: "faramesh cannot be opened because the developer cannot be verified"
+
+**Cause:** macOS Gatekeeper blocks unsigned binaries.
+
+**Solution:** Allow the binary in System Preferences:
+1. Go to **System Preferences > Security & Privacy**
+2. Click **"Allow Anyway"** next to the faramesh warning
+3. Run `faramesh demo` again and click **"Open"**
+
+Alternatively, use Homebrew (which handles code signing automatically):
+```bash
+brew install faramesh/tap/faramesh
+```
+
+---
+
+### Install script fails with "SHA256 mismatch"
+
+**Cause:** The downloaded binary is corrupted or the release is compromised.
+
+**Solution 1:** Retry the installation (network glitch):
+```bash
+curl -fsSL https://raw.githubusercontent.com/faramesh/faramesh-core/main/install.sh | sh
+```
+
+**Solution 2:** Manually verify the checksum:
+```bash
+# Download binary and checksum
+curl -LO https://github.com/faramesh/faramesh-core/releases/latest/download/faramesh-linux-amd64
+curl -LO https://github.com/faramesh/faramesh-core/releases/latest/download/faramesh-linux-amd64.sha256
+
+# Verify
+sha256sum -c faramesh-linux-amd64.sha256
+```
+
+If the checksum still fails, **do not use the binary**. Report the issue on [GitHub](https://github.com/faramesh/faramesh-core/issues).
+
+---
+
+### Go install: "build constraints exclude all Go files"
+
+**Cause:** Your Go version is too old.
+
+**Solution:** Upgrade to Go 1.25 or later:
+```bash
+go version  # Check current version
+
+# Upgrade via Homebrew (macOS/Linux):
+brew upgrade go
+
+# Or download from https://go.dev/dl/
+```
+
+---
+
+## Uninstall
+
+<Tabs>
+  <Tab title="Homebrew">
+    ```bash
+    brew uninstall faramesh
+    ```
+  </Tab>
+
+  <Tab title="install.sh">
+    ```bash
+    # Remove binary (adjust path if you installed elsewhere)
+    rm /usr/local/bin/faramesh
+    # or
+    rm ~/.local/bin/faramesh
+
+    # Remove config and data (optional)
+    rm -rf ~/.faramesh
+    ```
+  </Tab>
+
+  <Tab title="Go toolchain">
+    ```bash
+    rm $(go env GOPATH)/bin/faramesh
+    rm -rf ~/.faramesh  # Optional: remove config and data
+    ```
+  </Tab>
+
+  <Tab title="Python SDK">
+    ```bash
+    pip uninstall faramesh
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    See Faramesh in action in 30 seconds
+  </Card>
+  <Card title="Writing Policies" icon="file-code" href="/policy/writing-policies">
+    Learn how to write governance policies
+  </Card>
+  <Card title="Python SDK Guide" icon="python" href="/guides/python-sdk">
+    Deep dive into `govern()` and exception handling
+  </Card>
+  <Card title="CLI Reference" icon="terminal" href="/cli/demo">
+    Complete CLI command reference
+  </Card>
+</CardGroup>

@@ -1,0 +1,208 @@
+---
+title: govern()
+description: Wrap any function with Faramesh governance
+---
+
+The `govern()` decorator wraps any callable so that every invocation is governed by the Faramesh pipeline before the underlying function executes. Zero infrastructure required in development mode — the daemon is auto-started on the first call.
+
+## Function Signature
+
+```python
+def govern(
+    fn: Callable,
+    *,
+    policy: str = "policy.yaml",
+    agent_id: str | None = None,
+    tool_id: str | None = None,
+    socket_path: str = "/tmp/faramesh.sock",
+    auto_start: bool = True,
+) -> Callable
+```
+
+## Parameters
+
+<ParamField path="fn" type="Callable" required>
+  The function to govern. Can be any Python callable.
+</ParamField>
+
+<ParamField path="policy" type="str" default="policy.yaml">
+  Path to the policy YAML file.
+</ParamField>
+
+<ParamField path="agent_id" type="str | None" default="None">
+  Agent identity. Defaults to the function's module + name (e.g., `module.function_name`).
+</ParamField>
+
+<ParamField path="tool_id" type="str | None" default="None">
+  Tool identifier used in the policy. Defaults to `fn.__name__`.
+</ParamField>
+
+<ParamField path="socket_path" type="str" default="/tmp/faramesh.sock">
+  Daemon Unix socket path.
+</ParamField>
+
+<ParamField path="auto_start" type="bool" default="true">
+  If `True`, auto-start the daemon on the first call (dev mode).
+</ParamField>
+
+## Returns
+
+<ResponseField name="function" type="Callable">
+  A wrapped function with the same signature, docstring, and type hints as the original.
+  
+  **Raises:**
+  - `DenyError` on DENY
+  - `DeferredError` on DEFER timeout or denial
+</ResponseField>
+
+## Signature Preservation
+
+The `govern()` decorator preserves the original function's metadata:
+
+- `functools.wraps` copies `__name__`, `__doc__`, `__annotations__`, `__module__`
+- `__wrapped__` is set to the original function for introspection
+- Pydantic `BaseModel` parameters are passed through unchanged
+- LangChain `@tool` decorator metadata is preserved
+
+## Usage
+
+### Basic Example
+
+```python
+from faramesh import govern
+
+def stripe_refund(amount: int, currency: str) -> dict:
+    """Process a refund via Stripe."""
+    # ... actual refund logic
+    return {"status": "refunded", "amount": amount}
+
+governed_refund = govern(
+    stripe_refund,
+    policy='payment.yaml',
+    agent_id='payment-bot'
+)
+
+# Every call is now governed
+result = governed_refund(amount=100, currency='usd')
+```
+
+### Decorator Syntax
+
+<CodeGroup>
+
+```python Basic
+from faramesh import govern
+
+@govern
+def delete_user(user_id: str) -> bool:
+    # Uses default policy.yaml
+    db.delete(user_id)
+    return True
+```
+
+```python Custom Policy
+from faramesh import govern
+
+@govern(policy="admin.yaml", agent_id="admin-bot")
+def reset_database() -> None:
+    db.drop_all_tables()
+    db.create_all_tables()
+```
+
+</CodeGroup>
+
+### LangChain @tool Preservation
+
+<Note>
+  The `govern()` decorator preserves LangChain's `@tool` metadata including `name`, `description`, and `args_schema`.
+</Note>
+
+```python
+from langchain.tools import tool
+from faramesh import govern
+
+@tool
+def web_search(query: str) -> str:
+    """Search the web for information."""
+    return search_api.query(query)
+
+# Apply governance on top of @tool
+governed_search = govern(
+    web_search,
+    policy="agent.yaml",
+    agent_id="research-agent"
+)
+
+# LangChain sees the original metadata
+assert governed_search.name == "web_search"
+assert governed_search.description == "Search the web for information."
+```
+
+### Pydantic Model Support
+
+The decorator automatically serializes Pydantic models using `.model_dump()` (v2) or `.dict()` (v1):
+
+```python
+from pydantic import BaseModel
+from faramesh import govern
+
+class RefundRequest(BaseModel):
+    order_id: str
+    amount: int
+    reason: str
+
+@govern(policy="payments.yaml")
+def process_refund(request: RefundRequest) -> dict:
+    # Pydantic model is serialized for governance
+    return stripe.refund(request.order_id, request.amount)
+
+# Usage
+req = RefundRequest(order_id="ord_123", amount=5000, reason="defective")
+result = process_refund(req)
+```
+
+## Exception Handling
+
+```python
+from faramesh import govern, DenyError, DeferredError
+
+@govern(policy="strict.yaml")
+def critical_action(user_id: str) -> None:
+    # ... sensitive operation
+    pass
+
+try:
+    critical_action(user_id="user_123")
+except DenyError as e:
+    print(f"Policy denied: {e.reason}")
+    print(f"Rule: {e.rule_id}")
+    print(f"Code: {e.reason_code}")
+except DeferredError as e:
+    print(f"Requires approval: {e.defer_token}")
+    print(f"Reason: {e.reason}")
+    if e.expired:
+        print("Approval window expired")
+```
+
+## Auto-Start Behavior
+
+When `auto_start=True` (default), the Faramesh daemon is automatically started on the first `govern()` call:
+
+1. The binary is downloaded from GitHub Releases (if not cached)
+2. The daemon is started as a subprocess: `faramesh serve --policy <policy> --socket <socket_path>`
+3. The SDK waits up to 3 seconds for the socket to appear
+4. Subsequent calls reuse the running daemon
+
+To disable auto-start (e.g., in production):
+
+```python
+@govern(policy="prod.yaml", auto_start=False)
+def production_tool() -> None:
+    pass
+```
+
+With `auto_start=False`, you must manually start the daemon:
+
+```bash
+faramesh serve --policy prod.yaml --socket /tmp/faramesh.sock
+```

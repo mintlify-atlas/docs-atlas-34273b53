@@ -1,0 +1,341 @@
+---
+title: Exceptions
+description: Faramesh exception hierarchy for governance errors
+---
+
+Faramesh defines a structured exception hierarchy for handling governance failures. All exceptions inherit from the base `FarameshError` class.
+
+## Exception Hierarchy
+
+```python
+FarameshError (base)
+├── DenyError
+├── DeferredError
+└── DaemonError
+```
+
+## FarameshError
+
+Base class for all Faramesh errors.
+
+```python
+class FarameshError(Exception):
+    """Base class for all Faramesh errors."""
+```
+
+## DenyError
+
+Raised when the governance policy denies a tool call.
+
+```python
+class DenyError(FarameshError):
+    def __init__(
+        self,
+        tool_id: str,
+        rule_id: str | None,
+        reason_code: str,
+        reason: str,
+    )
+```
+
+### Attributes
+
+<ResponseField name="tool_id" type="str">
+  The tool that was denied.
+</ResponseField>
+
+<ResponseField name="rule_id" type="str | None">
+  The ID of the rule that denied the call, or `None` for default deny.
+</ResponseField>
+
+<ResponseField name="reason_code" type="str">
+  Machine-readable denial reason code (e.g., `"DENY"`, `"RATE_LIMIT"`).
+</ResponseField>
+
+<ResponseField name="reason" type="str">
+  Human-readable denial explanation (e.g., `"denied by policy"`, `"amount exceeds limit"`).
+</ResponseField>
+
+### Usage
+
+```python
+from faramesh import govern, DenyError
+
+@govern(policy="strict.yaml")
+def delete_production_database() -> None:
+    db.drop_all_tables()
+
+try:
+    delete_production_database()
+except DenyError as e:
+    print(f"Action denied: {e.reason}")
+    print(f"Rule: {e.rule_id}")
+    print(f"Code: {e.reason_code}")
+    print(f"Tool: {e.tool_id}")
+    # Output:
+    # Action denied: production database operations require approval
+    # Rule: deny_prod_writes
+    # Code: DENY
+    # Tool: delete_production_database
+```
+
+### Exception Message Format
+
+```python
+DENY  {tool_id}  rule={rule_id or 'default'}  reason={reason}
+```
+
+Example:
+
+```
+DENY  stripe_refund  rule=refund_limit  reason=amount exceeds $1000 threshold
+```
+
+## DeferredError
+
+Raised when a tool call is deferred pending human approval. The SDK blocks waiting for resolution. This exception is only raised if the DEFER times out or is explicitly denied by the approver.
+
+```python
+class DeferredError(FarameshError):
+    def __init__(
+        self,
+        tool_id: str,
+        defer_token: str,
+        reason: str,
+        expired: bool = False,
+    )
+```
+
+### Attributes
+
+<ResponseField name="tool_id" type="str">
+  The tool that was deferred.
+</ResponseField>
+
+<ResponseField name="defer_token" type="str">
+  The token to use for approval via `faramesh agent approve <token>`.
+</ResponseField>
+
+<ResponseField name="reason" type="str">
+  Why the call was deferred (e.g., `"action requires human approval"`).
+</ResponseField>
+
+<ResponseField name="expired" type="bool">
+  `True` if the approval window expired, `False` if explicitly denied.
+</ResponseField>
+
+### Usage
+
+<CodeGroup>
+
+```python Timeout Example
+from faramesh import govern, DeferredError
+
+@govern(policy="defer.yaml")
+def wire_transfer(amount: int, recipient: str) -> dict:
+    return bank.transfer(amount, recipient)
+
+try:
+    wire_transfer(amount=50000, recipient="external-account")
+except DeferredError as e:
+    if e.expired:
+        print(f"Approval timeout: {e.reason}")
+        print(f"Token: {e.defer_token}")
+        # Output:
+        # Approval timeout: action requires human approval
+        # Token: defer_abc123xyz
+    else:
+        print(f"Explicitly denied: {e.defer_token}")
+```
+
+```python Approval Flow
+from faramesh import govern, DeferredError
+import logging
+
+@govern(policy="approval.yaml")
+def critical_operation(target: str) -> None:
+    # ... dangerous operation
+    pass
+
+try:
+    critical_operation(target="production")
+except DeferredError as e:
+    logging.warning(
+        f"Action deferred: {e.tool_id}",
+        extra={"defer_token": e.defer_token, "reason": e.reason},
+    )
+    
+    # Notify approver
+    slack.send_message(
+        f"⚠️ Action requires approval\n"
+        f"Tool: {e.tool_id}\n"
+        f"Approve: `faramesh agent approve {e.defer_token}`"
+    )
+    
+    raise  # Re-raise to halt execution
+```
+
+</CodeGroup>
+
+### Exception Message Format
+
+When `expired=True`:
+
+```python
+DEFER expired  {tool_id}  token={defer_token}  Approve: faramesh agent approve {defer_token}
+```
+
+When `expired=False`:
+
+```python
+DEFER denied  {tool_id}  token={defer_token}
+```
+
+Example:
+
+```
+DEFER expired  wire_transfer  token=defer_xyz789  Approve: faramesh agent approve defer_xyz789
+```
+
+## DaemonError
+
+Raised when the faramesh daemon cannot be started or contacted.
+
+```python
+class DaemonError(FarameshError):
+    """Raised when the faramesh daemon cannot be started or contacted."""
+```
+
+### Common Causes
+
+1. **Socket not found**: Daemon not running
+2. **Connection refused**: Daemon crashed or socket path mismatch
+3. **Timeout**: Daemon overloaded or unresponsive
+
+### Usage
+
+```python
+from faramesh import govern, DaemonError
+import sys
+
+@govern(policy="app.yaml", auto_start=False)
+def my_tool() -> None:
+    pass
+
+try:
+    my_tool()
+except DaemonError as e:
+    print(f"Daemon error: {e}", file=sys.stderr)
+    print("Start the daemon manually:", file=sys.stderr)
+    print("  faramesh serve --policy app.yaml", file=sys.stderr)
+    sys.exit(1)
+```
+
+### Error Messages
+
+<CodeGroup>
+
+```python Socket Not Found
+DaemonError: Daemon socket not found at /tmp/faramesh.sock. Is the daemon running? Run: faramesh serve --policy policy.yaml
+```
+
+```python Connection Refused
+DaemonError: Connection refused at /tmp/faramesh.sock. Is the daemon running? Run: faramesh serve --policy policy.yaml
+```
+
+```python Generic OSError
+DaemonError: Socket error communicating with daemon: [Errno 2] No such file or directory
+```
+
+</CodeGroup>
+
+## Exception Handling Patterns
+
+### Catch All Faramesh Errors
+
+```python
+from faramesh import govern, FarameshError
+
+@govern(policy="policy.yaml")
+def my_action() -> None:
+    # ... implementation
+    pass
+
+try:
+    my_action()
+except FarameshError as e:
+    # Catch DenyError, DeferredError, DaemonError
+    print(f"Governance error: {e}")
+```
+
+### Specific Error Handling
+
+```python
+from faramesh import govern, DenyError, DeferredError, DaemonError
+
+@govern(policy="policy.yaml")
+def risky_operation(amount: int) -> dict:
+    return {"status": "success", "amount": amount}
+
+try:
+    result = risky_operation(amount=5000)
+except DenyError as e:
+    # Policy explicitly denied the action
+    audit_log.record_denial(e.tool_id, e.rule_id, e.reason)
+    raise
+except DeferredError as e:
+    # Action requires approval
+    if e.expired:
+        notify_timeout(e.defer_token)
+    else:
+        notify_denied(e.defer_token)
+    raise
+except DaemonError as e:
+    # Infrastructure issue
+    alert_ops("Faramesh daemon unreachable", str(e))
+    raise
+```
+
+### Graceful Degradation
+
+```python
+from faramesh import govern, DenyError, DaemonError
+import logging
+
+@govern(policy="optional.yaml", auto_start=False)
+def optional_governance_action() -> None:
+    # ... implementation
+    pass
+
+try:
+    optional_governance_action()
+except DenyError:
+    # Respect policy denial
+    logging.warning("Action denied by policy")
+    raise
+except DaemonError:
+    # Daemon not available — proceed without governance
+    logging.error("Governance daemon unavailable, executing without governance")
+    # Call the underlying function directly
+    optional_governance_action.__wrapped__()
+```
+
+### Testing Error Conditions
+
+```python
+import pytest
+from faramesh import govern, DenyError
+
+@govern(policy="test.yaml")
+def restricted_action() -> None:
+    pass
+
+def test_deny_error():
+    """Test that the policy correctly denies the action."""
+    with pytest.raises(DenyError) as exc_info:
+        restricted_action()
+    
+    assert exc_info.value.tool_id == "restricted_action"
+    assert exc_info.value.reason_code == "DENY"
+    assert "policy" in exc_info.value.reason.lower()
+```

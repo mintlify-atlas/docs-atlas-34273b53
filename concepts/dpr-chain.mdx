@@ -1,0 +1,443 @@
+---
+title: 'DPR Chain'
+description: 'Tamper-evident Decision-Provenance Record audit trail'
+---
+
+## Overview
+
+Every governance decision is recorded in a **Decision-Provenance Record (DPR)** chain — a per-agent, tamper-evident audit log where each record is cryptographically linked to the previous one via SHA256 hashing.
+
+<Info>
+**WAL-First Invariant**: A durable DPR record is written to disk (and fsynced) **before** the decision is returned to the caller. No execution without an audit record — under any failure mode.
+</Info>
+
+## DPR Record Structure
+
+Each DPR record contains:
+
+```json
+{
+  "schema_version": "dpr/1.0",
+  "record_id": "550e8400-e29b-41d4-a716-446655440000",
+  "prev_record_hash": "a3f5b2...",
+  "record_hash": "7c8e1d...",
+  
+  "agent_id": "payment-bot",
+  "session_id": "sess_abc123",
+  "tool_id": "stripe/refund",
+  "intercept_adapter": "sdk",
+  
+  "effect": "PERMIT",
+  "matched_rule_id": "permit-normal-refund",
+  "reason_code": "WITHIN_THRESHOLD",
+  "reason": "refund within authorized threshold",
+  
+  "policy_version": "sha256:8f3a...",
+  "args_structural_sig": "e2a1f9...",
+  
+  "created_at": "2026-03-14T10:23:45Z"
+}
+```
+
+See [record.go:17-95](https://github.com/faramesh/faramesh-core/blob/main/internal/core/dpr/record.go:17) for the complete schema.
+
+## Chain Integrity
+
+Each record includes:
+
+<Steps>
+  <Step title="record_hash">
+    SHA256 hash of this record's canonical bytes.
+    ```go
+    record_hash = SHA256(CanonicalBytes(record))
+    ```
+  </Step>
+  
+  <Step title="prev_record_hash">
+    SHA256 hash of the **previous** record in the chain.
+    
+    This creates a linked list where tampering with any record breaks the chain.
+  </Step>
+  
+  <Step title="Genesis Record">
+    The first record for an agent has:
+    ```go
+    prev_record_hash = SHA256(agent_id + session_id + "genesis")
+    ```
+  </Step>
+</Steps>
+
+### Chain Verification
+
+Verify chain integrity:
+
+```bash
+faramesh audit verify ~/.faramesh/faramesh.db
+```
+
+Output:
+```
+✓ Chain integrity verified. 1,247 records, 0 violations.
+```
+
+This walks the entire DPR chain and validates:
+1. Each `record_hash` matches `SHA256(CanonicalBytes(record))`
+2. Each `prev_record_hash` matches the previous record's `record_hash`
+3. No gaps in the chain
+
+<Warning>
+If **any** record is modified after creation, verification fails. The chain is tamper-evident.
+</Warning>
+
+## Canonical Bytes
+
+The `record_hash` is computed from a deterministic canonical byte representation:
+
+```go
+// From record.go:100-151
+func (r *Record) CanonicalBytes() []byte {
+    // Exclude record_hash and hmac_signature from canonical form
+    type canon struct {
+        SchemaVersion      string
+        RecordID           string
+        PrevRecordHash     string
+        AgentID            string
+        ToolID             string
+        Effect             string
+        PolicyVersion      string
+        ArgsStructuralSig  string
+        CreatedAt          time.Time
+        // ... all fields except record_hash and hmac_signature
+    }
+    return json.Marshal(canon{...})
+}
+
+func (r *Record) ComputeHash() {
+    r.RecordHash = fmt.Sprintf("%x", sha256.Sum256(r.CanonicalBytes()))
+}
+```
+
+See [record.go:100-156](https://github.com/faramesh/faramesh-core/blob/main/internal/core/dpr/record.go:100) for the implementation.
+
+## Argument Privacy
+
+DPR records **never** store raw argument values — only a structural signature:
+
+```yaml
+args_structural_sig: "e2a1f9..."
+```
+
+The signature captures:
+- Argument key names
+- Value types (string, number, bool, array, object)
+- Object/array structure
+
+**But NOT** the actual values. This prevents PII/secrets from appearing in audit logs.
+
+### Example
+
+```go
+args := map[string]any{
+    "amount": 100,
+    "currency": "usd",
+    "customer": map[string]any{
+        "email": "user@example.com",
+        "tier": "pro",
+    },
+}
+
+// Structural signature:
+// {amount:number,currency:string,customer:{email:string,tier:string}}
+// Hashed to: "a3f5b2c8..."
+```
+
+See [record.go:158-195](https://github.com/faramesh/faramesh-core/blob/main/internal/core/dpr/record.go:158) for the signature algorithm.
+
+## WAL-First Invariant
+
+Faramesh guarantees that **every decision has a durable audit record before it is returned**.
+
+From [pipeline.go:339-363](https://github.com/faramesh/faramesh-core/blob/main/internal/core/pipeline.go:339):
+
+```go
+// decide writes the WAL record and returns the Decision.
+// This is the WAL ORDERING INVARIANT implementation:
+// no decision is returned until the record is fsynced.
+func (p *Pipeline) decide(req CanonicalActionRequest, d Decision, 
+                          sess *session.State, start time.Time) Decision {
+    // [9] WAL write — fsync before returning.
+    rec := p.buildRecord(req, d)
+    if err := p.wal.Write(rec); err != nil {
+        // If we can't write the audit record, we must deny.
+        // Execution must never precede the audit record.
+        return Decision{
+            Effect:     EffectDeny,
+            ReasonCode: reasons.WALWriteFailure,
+            Reason:     "audit record write failed; denying to preserve WAL invariant",
+        }
+    }
+    
+    // [10] Async: replicate to SQLite, update session history
+    go p.store.Save(rec)
+    
+    // [11] Return Decision
+    return d
+}
+```
+
+### Failure Modes
+
+<Accordion title="WAL write fails">
+  If the WAL `fsync()` fails → the decision is **DENY**.
+  
+  The agent receives a `DENY` with `reason_code: WAL_WRITE_FAILURE`.
+</Accordion>
+
+<Accordion title="Process crashes after WAL write">
+  If the daemon crashes **after** the WAL write but **before** SQLite replication:
+  
+  - The decision was already returned to the agent
+  - The WAL record exists on disk
+  - On restart, the WAL replays and backfills the SQLite store
+  - No gap in the audit chain
+</Accordion>
+
+<Accordion title="Process crashes before WAL write">
+  If the daemon crashes **before** the WAL write:
+  
+  - The agent's SDK call times out or returns a connection error
+  - No decision was returned → the tool call did not execute
+  - No DPR record exists (correct behavior — no execution, no audit record)
+</Accordion>
+
+<Note>
+**Invariant**: Under all failure modes, either:
+1. A durable DPR record exists AND the decision was returned, OR
+2. No DPR record exists AND no decision was returned
+
+It is **impossible** for execution to occur without a corresponding DPR record.
+</Note>
+
+## Storage Backends
+
+DPR records are written to two places:
+
+### 1. Write-Ahead Log (WAL)
+
+Append-only file on disk. Fsynced on every write.
+
+- **Location**: `~/.faramesh/wal/`
+- **Format**: Newline-delimited JSON
+- **Purpose**: Durability guarantee (WAL-first invariant)
+- **Replay**: On restart, unseen WAL entries are replayed into SQLite
+
+### 2. SQLite Store
+
+Structured database for querying and chain verification.
+
+- **Location**: `~/.faramesh/faramesh.db`
+- **Schema**: Per-agent tables with indexes on `session_id`, `created_at`, `effect`
+- **Purpose**: Fast queries, chain verification, audit exports
+- **Replication**: Asynchronous (does not block decision latency)
+
+See [sqlite.go](https://github.com/faramesh/faramesh-core/blob/main/internal/core/dpr/sqlite.go) for the implementation.
+
+## Querying the Audit Log
+
+### Tail Live Decisions
+
+Stream decisions in real time:
+
+```bash
+faramesh audit tail
+```
+
+Output:
+```
+[10:00:15] PERMIT  get_exchange_rate      from=USD to=SEK              latency=11ms
+[10:00:17] DENY    shell/run              cmd="rm -rf /"               latency=0ms
+[10:00:18] PERMIT  read_customer          id=cust_abc123               latency=9ms
+[10:00:20] DEFER   stripe/refund          amount=$12,000               policy=defer-high-value
+```
+
+### Export to JSON
+
+Export all records for an agent:
+
+```bash
+faramesh audit export --agent-id payment-bot --format json > audit.json
+```
+
+### Filter by Effect
+
+Show only DENY decisions:
+
+```bash
+faramesh audit tail --effect DENY
+```
+
+### Session History
+
+Show all decisions in a session:
+
+```bash
+faramesh audit session sess_abc123
+```
+
+## Privacy and Compliance
+
+<CardGroup cols={2}>
+  <Card title="GDPR-Safe" icon="shield-check">
+    No raw argument values stored. Only structural signatures.
+  </Card>
+  
+  <Card title="Pseudonymized Principals" icon="user-secret">
+    Principal IDs are HMAC-hashed before storage:
+    ```json
+    "principal_id_hash": "a3f5b2..."
+    ```
+  </Card>
+  
+  <Card title="Retention Policies" icon="clock">
+    Configure automatic DPR purging:
+    ```yaml
+    retention:
+      days: 90
+      on_purge: archive_to_s3
+    ```
+  </Card>
+  
+  <Card title="Compliance Exports" icon="file-export">
+    Export to SOC 2, HIPAA, or EU AI Act formats.
+  </Card>
+</CardGroup>
+
+## Chain Metadata
+
+Each record includes:
+
+### Policy Version
+
+The SHA256 hash of the active policy at decision time:
+
+```json
+"policy_version": "sha256:8f3a2b..."
+```
+
+This proves which policy version governed each decision.
+
+### FPL Version
+
+The Faramesh Policy Language version:
+
+```json
+"fpl_version": "1.0"
+```
+
+### CAR Version
+
+The Canonical Action Request specification version:
+
+```json
+"car_version": "car/1.0"
+```
+
+These versions ensure forward compatibility as Faramesh evolves.
+
+## Multi-Agent Linkage
+
+When one agent invokes another:
+
+```json
+{
+  "agent_id": "sub-agent",
+  "invoked_by_agent_id": "orchestrator",
+  "invoked_by_dpr_record_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+This creates a **cross-agent provenance graph** showing delegation chains.
+
+## Verification Algorithm
+
+The `faramesh audit verify` command:
+
+<Steps>
+  <Step title="Load All Records">
+    Read all DPR records from SQLite, ordered by `created_at` per agent.
+  </Step>
+  
+  <Step title="Verify Genesis">
+    Check the first record's `prev_record_hash` matches:
+    ```go
+    SHA256(agent_id + session_id + "genesis")
+    ```
+  </Step>
+  
+  <Step title="Walk the Chain">
+    For each record:
+    ```go
+    computed_hash := SHA256(record.CanonicalBytes())
+    if computed_hash != record.RecordHash {
+        return "TAMPERED: record hash mismatch"
+    }
+    if record.PrevRecordHash != previous.RecordHash {
+        return "BROKEN: chain link mismatch"
+    }
+    ```
+  </Step>
+  
+  <Step title="Report">
+    Output summary:
+    ```
+    ✓ Chain integrity verified. 1,247 records, 0 violations.
+    ```
+  </Step>
+</Steps>
+
+## Example: Full DPR Record
+
+```json
+{
+  "schema_version": "dpr/1.0",
+  "fpl_version": "1.0",
+  "car_version": "car/1.0",
+  "record_id": "550e8400-e29b-41d4-a716-446655440000",
+  "prev_record_hash": "a3f5b2c8e1d4f7a9b2c5d8e1f4a7b0c3d6e9f2a5b8c1d4e7f0a3b6c9d2e5f8a1",
+  "record_hash": "7c8e1d4f7a0b3c6d9e2f5a8b1c4d7e0f3a6b9c2d5e8f1a4b7c0d3e6f9a2b5c8",
+  
+  "agent_id": "payment-bot",
+  "session_id": "sess_abc123",
+  "tool_id": "stripe/refund",
+  "intercept_adapter": "sdk",
+  "principal_id_hash": "a3f5b2c8e1d4f7a9",
+  
+  "effect": "PERMIT",
+  "matched_rule_id": "permit-normal-refund",
+  "reason_code": "WITHIN_THRESHOLD",
+  "reason": "refund within authorized threshold",
+  
+  "incident_category": "",
+  "incident_severity": "",
+  
+  "policy_version": "sha256:8f3a2b5c7e0d3f6a9c2e5f8b1d4a7c0e3f6a9c2d5e8f1a4b7c0d3e6f9a2b5c8",
+  "policy_source_type": "file",
+  "policy_source_id": "/etc/faramesh/payment.yaml",
+  
+  "args_structural_sig": "e2a1f9c3b5d7a0e3",
+  
+  "created_at": "2026-03-14T10:23:45.123456Z"
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="DEFER Workflow" icon="hand" href="/concepts/defer-workflow">
+    Learn about human-in-the-loop approvals for high-stakes actions.
+  </Card>
+  
+  <Card title="Adapters" icon="puzzle-piece" href="/concepts/adapters">
+    Understand how different adapters deliver requests to the core.
+  </Card>
+</CardGroup>

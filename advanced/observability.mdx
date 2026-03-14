@@ -1,0 +1,616 @@
+---
+title: "Observability & Analytics"
+description: "Structured logging, OpenTelemetry integration, metrics collection, PIE (Policy Impact Estimation), audit trail, and cross-session analytics"
+---
+
+Faramesh provides production-grade observability with structured logging, OpenTelemetry tracing, Prometheus metrics, and Policy Intelligence Engine (PIE) analytics.
+
+---
+
+## Structured Logging
+
+Faramesh uses a **mandatory field classification schema** with automatic PII redaction.
+
+### Log Schema
+
+```go
+// internal/core/observe/logschema.go:30
+var LogSchema = []LogField{
+    // Public fields — safe in all contexts
+    {Name: "timestamp", Class: FieldPublic},
+    {Name: "level", Class: FieldPublic},
+    {Name: "effect", Class: FieldPublic},
+    {Name: "reason_code", Class: FieldPublic},
+    {Name: "tool_id", Class: FieldPublic},
+    {Name: "agent_id", Class: FieldPublic},
+    {Name: "session_id", Class: FieldPublic},
+    {Name: "dpr_record_id", Class: FieldPublic},
+    {Name: "policy_version", Class: FieldPublic},
+    {Name: "latency_us", Class: FieldPublic},
+
+    // Internal fields — not exposed externally
+    {Name: "rule_id", Class: FieldInternal},
+    {Name: "denial_token", Class: FieldInternal},
+
+    // Sensitive fields — access-controlled
+    {Name: "principal_id", Class: FieldSensitive},
+    {Name: "delegation_chain", Class: FieldSensitive},
+
+    // PII fields — auto-redacted
+    {Name: "principal_email", Class: FieldPII},
+    {Name: "principal_name", Class: FieldPII},
+    {Name: "args", Class: FieldPII},
+
+    // Secret fields — never logged
+    {Name: "credential_value", Class: FieldSecret},
+    {Name: "api_key", Class: FieldSecret},
+}
+```
+
+### Field Classification
+
+| Class | Description | Example |
+|-------|-------------|----------|
+| **FieldPublic** | Safe for any log destination | `effect`, `tool_id`, `latency_us` |
+| **FieldInternal** | Internal use, not for external export | `rule_id`, `denial_token` |
+| **FieldSensitive** | Requires access control on log storage | `principal_id`, `delegation_chain` |
+| **FieldPII** | Auto-redacted in all log output | `principal_email`, `args` |
+| **FieldSecret** | **Never logged under any circumstances** | `api_key`, `credential_value` |
+
+### Automatic Sanitization
+
+```go
+// internal/core/observe/logschema.go:92
+func (e LogEntry) Sanitize() LogEntry {
+    sanitized := LogEntry{
+        Timestamp: e.Timestamp,
+        Level:     e.Level,
+        Fields:    make(map[string]string),
+    }
+    for k, v := range e.Fields {
+        class := ClassifyField(k)
+        switch class {
+        case FieldSecret:
+            // Never include
+            continue
+        case FieldPII:
+            sanitized.Fields[k] = "[REDACTED]"
+        default:
+            sanitized.Fields[k] = v
+        }
+    }
+    return sanitized
+}
+```
+
+**Log Output Example:**
+
+```json
+{
+  "timestamp": "2026-03-14T10:15:23Z",
+  "level": "info",
+  "effect": "PERMIT",
+  "tool_id": "stripe/refund",
+  "agent_id": "billing-agent",
+  "session_id": "session_abc123",
+  "dpr_record_id": "dpr_xyz789",
+  "latency_us": 1247,
+  "principal_email": "[REDACTED]",
+  "args": "[REDACTED]"
+}
+```
+
+<Warning>
+  **Secret fields are NEVER logged.** Attempting to log `api_key` or `credential_value` will fail validation.
+</Warning>
+
+### External Export Sanitization
+
+For external systems (Splunk, Datadog, etc.), use stricter sanitization:
+
+```go
+// internal/core/observe/logschema.go:114
+func (e LogEntry) SanitizeForExternalExport() LogEntry {
+    sanitized := LogEntry{Fields: make(map[string]string)}
+    for k, v := range e.Fields {
+        class := ClassifyField(k)
+        switch class {
+        case FieldSecret, FieldPII:
+            continue  // omit entirely
+        case FieldSensitive, FieldInternal:
+            sanitized.Fields[k] = "[REDACTED]"
+        default:
+            sanitized.Fields[k] = v
+        }
+    }
+    return sanitized
+}
+```
+
+---
+
+## OpenTelemetry Integration
+
+Faramesh emits **OpenTelemetry spans** for distributed tracing.
+
+### Architecture
+
+```go
+// internal/core/observe/otel.go:32
+type Span struct {
+    TraceID    string            `json:"trace_id"`
+    SpanID     string            `json:"span_id"`
+    ParentID   string            `json:"parent_span_id,omitempty"`
+    Name       string            `json:"name"`
+    Kind       SpanKind          `json:"kind"`
+    StartTime  time.Time         `json:"start_time"`
+    EndTime    time.Time         `json:"end_time,omitempty"`
+    Status     SpanStatus        `json:"status"`
+    Attributes map[string]string `json:"attributes,omitempty"`
+    Events     []SpanEvent       `json:"events,omitempty"`
+}
+```
+
+### Enable OpenTelemetry
+
+```yaml
+# faramesh.yaml
+observability:
+  otel:
+    enabled: true
+    service_name: faramesh-daemon
+    exporter: otlp
+    endpoint: https://otel-collector.example.com:4317
+```
+
+**Start daemon with OTel:**
+
+```bash
+faramesh serve --policy policy.yaml --otel-endpoint https://otel-collector.example.com:4317
+```
+
+### Span Hierarchy
+
+```
+faramesh.govern (SpanKindServer)
+├─ faramesh.policy_eval (SpanKindInternal)
+├─ faramesh.dpr_write (SpanKindClient)
+└─ faramesh.defer (SpanKindInternal)
+```
+
+**Example Span:**
+
+```json
+{
+  "trace_id": "a1b2c3d4e5f6g7h8",
+  "span_id": "span_001",
+  "parent_span_id": null,
+  "name": "faramesh.govern",
+  "kind": "server",
+  "start_time": "2026-03-14T10:15:23.123Z",
+  "end_time": "2026-03-14T10:15:23.135Z",
+  "status": "ok",
+  "attributes": {
+    "faramesh.agent_id": "billing-agent",
+    "faramesh.tool_id": "stripe/refund",
+    "faramesh.effect": "PERMIT",
+    "service.name": "faramesh-daemon"
+  }
+}
+```
+
+### Cross-Agent Trace Propagation
+
+When one agent invokes another, trace context propagates:
+
+```go
+// internal/core/observe/otel.go:94
+func WithTrace(ctx context.Context, tc TraceContext) context.Context {
+    return context.WithValue(ctx, traceKey{}, tc)
+}
+
+func TraceFrom(ctx context.Context) (TraceContext, bool) {
+    tc, ok := ctx.Value(traceKey{}).(TraceContext)
+    return tc, ok
+}
+```
+
+**Result: Full trace across all agents in a session.**
+
+---
+
+## Metrics Collection
+
+Faramesh exposes **Prometheus-compatible metrics** at `/metrics`.
+
+### Metrics Endpoint
+
+```bash
+curl http://localhost:8080/metrics
+```
+
+**Output (Prometheus text format):**
+
+```prometheus
+# Decision counters
+faramesh_decisions_total{effect="permit"} 1247
+faramesh_decisions_total{effect="deny"} 89
+faramesh_decisions_total{effect="defer"} 34
+faramesh_decisions_total{effect="shadow"} 0
+
+# Deny reasons
+faramesh_deny_reasons_total{reason_code="HIGH_VALUE_REFUND"} 23
+faramesh_deny_reasons_total{reason_code="MASS_EMAIL_LIMIT"} 12
+faramesh_deny_reasons_total{reason_code="DESTRUCTIVE_SHELL_COMMAND"} 54
+
+# Latency histogram (seconds)
+faramesh_decision_latency_seconds_bucket{le="0.0001"} 847
+faramesh_decision_latency_seconds_bucket{le="0.00025"} 1102
+faramesh_decision_latency_seconds_bucket{le="0.0005"} 1247
+faramesh_decision_latency_seconds_bucket{le="0.001"} 1289
+faramesh_decision_latency_seconds_bucket{le="+Inf"} 1370
+faramesh_decision_latency_seconds_sum 1.247
+faramesh_decision_latency_seconds_count 1370
+
+# WAL writes
+faramesh_wal_writes_total{status="success"} 1370
+faramesh_wal_writes_total{status="error"} 0
+
+# Active sessions
+faramesh_active_sessions 12
+
+# Incidents prevented
+faramesh_incidents_prevented_total{category_severity="data_exfil:critical"} 7
+faramesh_incidents_prevented_per_1k_calls 5.1
+faramesh_shadow_mode_incident_exposure 0
+```
+
+### Metrics API
+
+```go
+// internal/core/observe/metrics.go:64
+func (m *Metrics) RecordDecision(effect string, reasonCode string, latency time.Duration) {
+    switch strings.ToUpper(effect) {
+    case "PERMIT":
+        m.permits.Add(1)
+    case "DENY":
+        m.denies.Add(1)
+        m.incrDenyReason(reasonCode)
+    case "DEFER":
+        m.defers.Add(1)
+    case "SHADOW":
+        m.shadows.Add(1)
+    }
+    m.recordLatency(latency)
+}
+```
+
+**Custom metrics:**
+
+```go
+import "github.com/faramesh/faramesh-core/internal/core/observe"
+
+observe.Default.RecordIncidentPrevented("data_exfil", "critical")
+observe.Default.RecordPostScan("REDACTED")
+observe.Default.SetActiveSessions(12)
+```
+
+### Grafana Dashboard
+
+Import the official Faramesh dashboard:
+
+```bash
+curl -o faramesh-dashboard.json \
+  https://grafana.com/api/dashboards/18247/revisions/1/download
+```
+
+**Dashboard includes:**
+- Decision rate by effect (PERMIT/DENY/DEFER)
+- P50/P95/P99 latency
+- Top deny reasons
+- WAL write success rate
+- Incidents prevented per 1K calls
+- Active sessions gauge
+
+---
+
+## PIE (Policy Impact Estimation)
+
+The **Policy Intelligence Engine** analyzes governance patterns to surface policy optimization opportunities.
+
+### Dead Rules Detection
+
+Find rules that haven't been triggered recently:
+
+```go
+// internal/core/observe/pie.go:96
+func (p *PIEAnalyzer) DeadRules(inactiveDuration time.Duration) []RuleStats {
+    cutoff := time.Now().Add(-inactiveDuration)
+    var dead []RuleStats
+    for _, stats := range p.rules {
+        if stats.LastTriggered.Before(cutoff) {
+            dead = append(dead, *stats)
+        }
+    }
+    return dead
+}
+```
+
+**CLI:**
+
+```bash
+faramesh policy analyze --dead-rules --since 30d
+```
+
+**Output:**
+```
+Dead Rules (not triggered in 30 days):
+  1. deny-ftp-access (last triggered: 87 days ago)
+  2. defer-ssh-root (last triggered: 45 days ago)
+  3. block-telnet (last triggered: 120 days ago)
+```
+
+### High-Approval DEFER Rules
+
+Find DEFER rules with high approval rates (candidates for PERMIT):
+
+```go
+// internal/core/observe/pie.go:115
+func (p *PIEAnalyzer) HighApprovalRules(threshold float64, minDefers int64) []PIERecommendation {
+    var recs []PIERecommendation
+    for _, stats := range p.rules {
+        if stats.Defers < minDefers {
+            continue
+        }
+        rate := stats.ApprovalRate()
+        if rate >= threshold {
+            recs = append(recs, PIERecommendation{
+                RuleID:       stats.RuleID,
+                Type:         "promote_to_permit",
+                ApprovalRate: rate,
+                TotalDefers:  stats.Defers,
+                Reason:       "High approval rate suggests this DEFER rule could be a PERMIT",
+            })
+        }
+    }
+    return recs
+}
+```
+
+**CLI:**
+
+```bash
+faramesh policy analyze --high-approval --threshold 0.95 --min-defers 10
+```
+
+**Output:**
+```
+High-Approval DEFER Rules (≥95% approved):
+  1. defer-db-schema-change (97.2% approved, 72 defers)
+     → Recommend: Promote to PERMIT with cost cap
+  
+  2. defer-bulk-email (96.1% approved, 51 defers)
+     → Recommend: Promote to PERMIT with recipient cap
+```
+
+### Policy Drift Detection
+
+Detect rules whose behavior has changed significantly:
+
+```go
+// internal/core/observe/pie.go:141
+func (p *PIEAnalyzer) PolicyDrift() []PIERecommendation {
+    var recs []PIERecommendation
+    for _, stats := range p.rules {
+        total := stats.TotalDecisions()
+        if total < 100 {
+            continue  // need enough data
+        }
+        permitRate := float64(stats.Permits) / float64(total)
+        denyRate := float64(stats.Denies) / float64(total)
+
+        if permitRate > 0.99 {
+            recs = append(recs, PIERecommendation{
+                RuleID: stats.RuleID,
+                Type:   "nearly_always_permits",
+                Reason: "Rule permits >99% of calls; consider if it's still needed",
+            })
+        }
+        if denyRate > 0.95 {
+            recs = append(recs, PIERecommendation{
+                RuleID: stats.RuleID,
+                Type:   "nearly_always_denies",
+                Reason: "Rule denies >95% of calls; may be misconfigured or too broad",
+            })
+        }
+    }
+    return recs
+}
+```
+
+**CLI:**
+
+```bash
+faramesh policy analyze --drift
+```
+
+**Output:**
+```
+Policy Drift Detected:
+  1. allow-analytics-read (99.8% permit rate)
+     → May be redundant (nearly always permits)
+  
+  2. deny-admin-api (97.1% deny rate)
+     → May be too broad (nearly always denies)
+```
+
+---
+
+## Audit Trail
+
+Faramesh provides a tamper-evident audit trail via the DPR chain.
+
+### Stream Live Decisions
+
+```bash
+faramesh audit tail --follow
+```
+
+**Output:**
+```
+[10:15:23] PERMIT  stripe/refund       amount=$45.00           latency=11ms
+[10:15:27] DENY    shell/run           cmd="rm -rf /"          scanner=SCANNER_DENY  latency=0ms
+[10:15:31] DEFER   db/schema_change    table=customers         awaiting approval  latency=9ms
+[10:15:35] PERMIT  api/get             endpoint=/health        latency=3ms
+```
+
+### Query Historical Decisions
+
+```bash
+# Last 100 decisions
+faramesh audit query --limit 100
+
+# Decisions for specific agent
+faramesh audit query --agent billing-agent --since 1h
+
+# Decisions by effect
+faramesh audit query --effect DENY --since 24h
+
+# Decisions by tool
+faramesh audit query --tool "stripe/*" --since 7d
+```
+
+### Verify DPR Chain Integrity
+
+```bash
+faramesh audit verify ~/.faramesh/faramesh.db
+```
+
+**Output:**
+```
+✓ Chain integrity verified
+✓ 1,247 records, 0 violations
+✓ Policy version matches for all records
+✓ SHA256 chain links valid
+```
+
+**Integrity Check Algorithm:**
+
+```go
+for i, record := range records {
+    if i > 0 {
+        if record.PrevRecordHash != records[i-1].RecordHash {
+            return fmt.Errorf("chain break at record %d", i)
+        }
+    }
+    if computeHash(record) != record.RecordHash {
+        return fmt.Errorf("record %d hash mismatch", i)
+    }
+}
+```
+
+---
+
+## Cross-Session Analytics
+
+Detect patterns across sessions, such as **read-then-exfil** attacks:
+
+```go
+// internal/core/observe/crosssession.go:22
+type ExfilPattern struct {
+    PrincipalID   string
+    ReadSession   string
+    ExfilSession  string
+    ReadTool      string
+    ExfilTool     string
+    TimeBetween   time.Duration
+    DetectedAt    time.Time
+}
+```
+
+### Example: Detect Data Exfiltration
+
+```go
+flowTracker := observe.NewFlowTracker()
+
+// Configure tool classifications
+flowTracker.SetReadTools([]string{"db/query", "db/read", "fs/read"})
+flowTracker.SetExfilTools([]string{"email/send", "api/post", "upload"})
+
+// Record accesses
+flowTracker.RecordAccess(observe.FlowRecord{
+    PrincipalID: "alice@example.com",
+    SessionID:   "session_001",
+    ToolID:      "db/read",
+    Effect:      "PERMIT",
+    Timestamp:   time.Now(),
+})
+
+flowTracker.RecordAccess(observe.FlowRecord{
+    PrincipalID: "alice@example.com",
+    SessionID:   "session_002",
+    ToolID:      "email/send",
+    Effect:      "PERMIT",
+    Timestamp:   time.Now().Add(5 * time.Minute),
+})
+
+// Detect patterns
+patterns := flowTracker.DetectExfilPatterns(30 * time.Minute)
+for _, p := range patterns {
+    fmt.Printf("Potential exfil: %s read in %s, sent via %s in %s (%v later)\n",
+        p.ReadTool, p.ReadSession, p.ExfilTool, p.ExfilSession, p.TimeBetween)
+}
+```
+
+**CLI:**
+
+```bash
+faramesh analytics exfil --principal alice@example.com --window 1h
+```
+
+**Output:**
+```
+Potential Data Exfiltration Detected:
+  Principal: alice@example.com
+  Read: db/read in session_001 (10:15:23)
+  Exfil: email/send in session_002 (10:20:31)
+  Time between: 5m8s
+```
+
+---
+
+## Best Practices
+
+<Steps>
+  <Step title="Enable Structured Logging">
+    Always use structured logging with field classification for compliance.
+  </Step>
+
+  <Step title="Export to External Systems">
+    Send logs to Splunk, Datadog, or ELK with `SanitizeForExternalExport()`.
+  </Step>
+
+  <Step title="Monitor Metrics in Grafana">
+    Import the official Faramesh dashboard for real-time monitoring.
+  </Step>
+
+  <Step title="Run PIE Analysis Monthly">
+    Use `faramesh policy analyze` to optimize policies based on usage patterns.
+  </Step>
+
+  <Step title="Verify DPR Chain Weekly">
+    Run `faramesh audit verify` to ensure chain integrity.
+  </Step>
+
+  <Step title="Enable Cross-Session Analytics">
+    Track exfil patterns for high-risk principals and tools.
+  </Step>
+</Steps>
+
+---
+
+## Related
+
+- [Multi-Agent Governance](/advanced/multi-agent) — Cross-agent linkage
+- [Security](/advanced/security) — Audit trail and DPR chain
+- [Cloud Platform](/advanced/cloud-platform) — Fleet-wide observability

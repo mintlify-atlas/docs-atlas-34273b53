@@ -1,0 +1,163 @@
+---
+title: Decision
+description: The output of the evaluation pipeline
+---
+
+## Overview
+
+The `Decision` struct represents the result of evaluating a [CanonicalActionRequest](/api/canonical-action-request) through the governance policy pipeline. It contains the authorization outcome, reasoning, and metadata for audit and enforcement.
+
+## Structure
+
+<ResponseField name="effect" type="Effect" required>
+  The governance outcome. See [Effect types](/api/effects) for possible values:
+  - `PERMIT` - Action is allowed
+  - `DENY` - Action is blocked
+  - `DEFER` - Action requires human approval
+  - `SHADOW` - Action is monitored but not enforced
+  - `SHADOW_PERMIT` - Action is allowed in shadow mode
+</ResponseField>
+
+<ResponseField name="rule_id" type="string" required>
+  The ID of the first rule that matched, or `""` for default deny.
+  
+  Used for policy debugging and audit correlation.
+</ResponseField>
+
+<ResponseField name="reason_code" type="string" required>
+  A machine-readable reason token, e.g. `"BUDGET_EXCEEDED"`, `"RESTRICTED_TOOL"`, `"ALLOWED"`.
+</ResponseField>
+
+<ResponseField name="reason" type="string" required>
+  A human-readable explanation of the decision, e.g. `"Monthly refund budget exceeded"`.
+</ResponseField>
+
+<ResponseField name="denial_token" type="string" optional>
+  An opaque token for operator lookup when `effect == DENY`.
+  
+  <Note>
+  **Oracle attack prevention:** No policy structure is exposed to the agent. The agent receives only this token, which operators can use to look up the full denial reason in audit logs.
+  </Note>
+</ResponseField>
+
+<ResponseField name="retry_permitted" type="boolean" optional>
+  Indicates whether the agent may retry this action.
+  
+  - `false` = Categorical deny (policy forbids this action entirely)
+  - `true` = State-dependent deny (budget exhausted, context stale — state may change)
+</ResponseField>
+
+<Expandable title="DEFER fields" defaultOpen={false}>
+  <ResponseField name="defer_token" type="string" optional>
+    Set when `effect == DEFER`. The SDK polls this token to discover when the approval resolves.
+  </ResponseField>
+
+  <ResponseField name="defer_expires_at" type="time.Time" optional>
+    When the DEFER auto-denies if unresolved. Prevents indefinite blocking.
+  </ResponseField>
+
+  <ResponseField name="defer_poll_interval_secs" type="integer" optional>
+    The suggested poll interval in seconds for `check_approval()` calls. Prevents aggressive polling.
+  </ResponseField>
+</Expandable>
+
+<Expandable title="Shadow mode fields" defaultOpen={false}>
+  <ResponseField name="shadow_actual_outcome" type="Effect" optional>
+    Set when `effect == SHADOW_PERMIT`, indicating what would have happened under enforcement mode.
+    
+    Enables safe policy testing without blocking production agents.
+  </ResponseField>
+</Expandable>
+
+<Expandable title="Observability fields" defaultOpen={false}>
+  <ResponseField name="incident_category" type="string" optional>
+    Classifies the governance event for observability, e.g. `"policy_violation"`, `"budget_limit"`.
+  </ResponseField>
+
+  <ResponseField name="incident_severity" type="string" optional>
+    Grades the governance event, e.g. `"low"`, `"medium"`, `"high"`, `"critical"`.
+  </ResponseField>
+</Expandable>
+
+<ResponseField name="policy_version" type="string" required>
+  The version string of the active policy that made this decision. Critical for audit reproducibility.
+</ResponseField>
+
+<ResponseField name="dpr_record_id" type="string" optional>
+  The ID of the DPR (Decision-Policy-Request) record created for this decision in the tamper-evident audit trail.
+</ResponseField>
+
+<ResponseField name="latency" type="time.Duration">
+  How long the pipeline took to evaluate this request. Not serialized to JSON (`json:"-"`).
+  
+  <Info>
+  Policy evaluation has a 50ms timeout. Exceeding this triggers a `GovernanceTimeoutError` and fails closed (DENY).
+  </Info>
+</ResponseField>
+
+## Example
+
+### Permit Decision
+
+```json
+{
+  "effect": "PERMIT",
+  "rule_id": "allow-tier1-refunds",
+  "reason_code": "ALLOWED",
+  "reason": "Tier 1 customer service agent within daily refund limit",
+  "policy_version": "v2.3.1",
+  "dpr_record_id": "dpr-a1b2c3d4"
+}
+```
+
+### Deny Decision with Oracle Protection
+
+```json
+{
+  "effect": "DENY",
+  "rule_id": "budget-limit",
+  "reason_code": "BUDGET_EXCEEDED",
+  "reason": "Monthly refund budget exceeded",
+  "denial_token": "dt_9f8e7d6c5b4a3210",
+  "retry_permitted": true,
+  "policy_version": "v2.3.1",
+  "dpr_record_id": "dpr-e5f6g7h8"
+}
+```
+
+### Defer Decision
+
+```json
+{
+  "effect": "DEFER",
+  "rule_id": "large-refund-approval",
+  "reason_code": "REQUIRES_APPROVAL",
+  "reason": "Refunds over $500 require manager approval",
+  "defer_token": "def_a1b2c3d4e5f6",
+  "defer_expires_at": "2026-03-14T18:00:00Z",
+  "defer_poll_interval_secs": 30,
+  "policy_version": "v2.3.1",
+  "dpr_record_id": "dpr-i9j0k1l2"
+}
+```
+
+### Shadow Permit Decision
+
+```json
+{
+  "effect": "SHADOW_PERMIT",
+  "rule_id": "new-experimental-policy",
+  "reason_code": "SHADOW_MODE",
+  "reason": "Testing new policy in shadow mode",
+  "shadow_actual_outcome": "DENY",
+  "incident_category": "policy_would_block",
+  "incident_severity": "medium",
+  "policy_version": "v3.0.0-beta",
+  "dpr_record_id": "dpr-m3n4o5p6"
+}
+```
+
+## Related Types
+
+- [CanonicalActionRequest](/api/canonical-action-request) - The input to the evaluation pipeline
+- [Effect](/api/effects) - The governance outcome constants

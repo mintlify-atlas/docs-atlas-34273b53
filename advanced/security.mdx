@@ -1,0 +1,508 @@
+---
+title: "Security Architecture"
+description: "Zero-trust architecture, SPIFFE workload identity, credential routing, oracle attack prevention, and adversarial testing"
+---
+
+Faramesh implements defense-in-depth security with zero-trust architecture, cryptographic identity, and adversarial testing.
+
+---
+
+## Zero-Trust Architecture
+
+Faramesh operates on zero-trust principles:
+
+<Steps>
+  <Step title="Deny by Default">
+    All actions are **denied unless explicitly permitted** by policy.
+    ```yaml
+    default_effect: deny  # safest default
+    ```
+  </Step>
+
+  <Step title="Cryptographic Identity">
+    Agents authenticate using **SPIFFE workload identity** (mTLS-based, no shared secrets).
+  </Step>
+
+  <Step title="Least Privilege">
+    Sub-agent policies enforce minimum required permissions via invocation-scoped constraints.
+  </Step>
+
+  <Step title="Immutable Audit">
+    Every decision is recorded in a **tamper-evident DPR chain** before execution.
+  </Step>
+
+  <Step title="No Side Effects Until Approval">
+    Policy evaluation has zero side effects — writes occur only after PERMIT/DEFER approval.
+  </Step>
+</Steps>
+
+---
+
+## SPIFFE Workload Identity
+
+Faramesh uses **SPIFFE** (Secure Production Identity Framework for Everyone) for cryptographic workload identity.
+
+### Architecture
+
+```go
+// internal/core/principal/spiffe.go:19
+type SVID struct {
+    SPIFFEID    string              `json:"spiffe_id"`
+    X509        *x509.Certificate   `json:"-"`
+    ExpiresAt   time.Time           `json:"expires_at"`
+    TrustDomain string              `json:"trust_domain"`
+}
+```
+
+**SPIFFE ID Format:**
+```
+spiffe://example.org/faramesh/agent/billing
+         └─────┬─────┘ └──────────┬──────────┘
+         trust domain    agent path
+```
+
+### Integration with SPIRE
+
+Faramesh connects to the **SPIRE Workload API** for automatic SVID rotation:
+
+```yaml
+# faramesh.yaml
+identity:
+  provider: spiffe
+  workload_api_socket: unix:///run/spire/sockets/agent.sock
+  trust_domain: example.org
+```
+
+**Start Faramesh with SPIFFE:**
+
+```bash
+# SPIRE registers the Faramesh daemon as a workload
+spire-server entry create \
+  -spiffeID spiffe://example.org/faramesh/daemon \
+  -parentID spiffe://example.org/node \
+  -selector unix:uid:1001
+
+# Faramesh fetches SVID on startup
+faramesh serve --policy policy.yaml
+```
+
+### Peer Verification
+
+The daemon verifies agent SVIDs against the trust bundle:
+
+```go
+// internal/core/principal/spiffe.go:120
+func (sp *SPIFFEProvider) VerifyPeer(peerSVID *SVID) error {
+    if peerSVID == nil {
+        return fmt.Errorf("nil peer SVID")
+    }
+    if !peerSVID.Valid() {
+        return fmt.Errorf("peer SVID expired")
+    }
+    if peerSVID.TrustDomain != sp.trustDomain {
+        return fmt.Errorf("peer trust domain %q does not match expected %q",
+            peerSVID.TrustDomain, sp.trustDomain)
+    }
+    // Verify x509 certificate chain against trust bundle
+    return nil
+}
+```
+
+<Note>
+  SVIDs are **automatically rotated** by SPIRE before expiry. Faramesh receives streaming updates via the Workload API.
+</Note>
+
+---
+
+## Credential Routing
+
+Faramesh brokers credentials via the **Credential Router** — agents never see raw secrets.
+
+### Architecture
+
+```
+┌────────────┐
+│ Agent Call │
+└──────┬─────┘
+       │
+       ▼
+┌──────────────────┐      ┌─────────────────┐
+│ Credential Router│─────▶│ Vault           │
+│                  │      │ AWS Secrets Mgr │
+│ Tool → Backend   │      │ GCP Secret Mgr  │
+└──────────────────┘      └─────────────────┘
+       │
+       │ Inject credential
+       ▼
+┌──────────────────┐
+│ Execute Tool     │
+└──────────────────┘
+       │
+       ▼ Revoke credential
+┌──────────────────┐
+│ Zero Memory      │
+└──────────────────┘
+```
+
+### Lifecycle: Fetch → Inject → Execute → Revoke
+
+```go
+// internal/core/credential/router.go:71
+func (r *Router) BrokerCall(ctx context.Context, req FetchRequest) (*CredentialHandle, error) {
+    broker := r.Resolve(req.ToolID)
+    if broker == nil {
+        return nil, fmt.Errorf("no credential broker for tool %q", req.ToolID)
+    }
+
+    if req.TTL == 0 {
+        req.TTL = 5 * time.Minute // default TTL
+    }
+
+    cred, err := broker.Fetch(ctx, req)
+    if err != nil {
+        return nil, err
+    }
+
+    return &CredentialHandle{
+        Credential: cred,
+        broker:     broker,
+    }, nil
+}
+```
+
+**Credential Handle:**
+
+```go
+// internal/core/credential/router.go:100
+func (h *CredentialHandle) Release(ctx context.Context) error {
+    if h.released {
+        return nil
+    }
+    h.released = true
+
+    var err error
+    if h.Credential.Revocable {
+        err = h.broker.Revoke(ctx, h.Credential)
+    }
+    // Zero the value regardless of revocation outcome
+    h.Credential.Value = ""
+    return err
+}
+```
+
+### Policy Configuration
+
+```yaml
+faramesh-version: '1.0'
+agent-id: payment-bot
+
+credentials:
+  backends:
+    - name: vault
+      type: hashicorp_vault
+      address: https://vault.example.com
+      
+    - name: aws_secrets
+      type: aws_secrets_manager
+      region: us-east-1
+      
+  routes:
+    # Map tool patterns to backends
+    "stripe/*": vault
+    "aws/*": aws_secrets
+    "db/*": vault
+
+rules:
+  - id: broker-stripe-credentials
+    match:
+      tool: stripe/refund
+    effect: permit
+    credential:
+      backend: vault
+      path: secret/stripe/live_key
+      ttl: 5m
+```
+
+<Warning>
+  **Never log credential values.** The credential router automatically zeroes credential memory after revocation.
+</Warning>
+
+---
+
+## Oracle Attack Prevention
+
+Faramesh implements **DenialToken opacity** to prevent policy structure reconstruction.
+
+### Threat Model
+
+An attacker attempts to probe policy structure by observing denial tokens, timing, or error messages.
+
+### Defense: Opaque Denial Tokens
+
+```go
+// tests/adversarial/oracle_test.go:16
+func TestOracle_DenialTokenOpacity(t *testing.T) {
+    // Test that denial tokens do NOT leak rule IDs
+    tokens := make(map[string]string)
+    for ruleID, tool := range tools {
+        d := pipeline.Evaluate(testCAR(tool, nil))
+        tokens[ruleID] = d.DenialToken
+    }
+
+    // Tokens must not reveal which rule matched
+    for id, tok := range tokens {
+        if strings.Contains(tok, id) {
+            t.Errorf("token for %s contains the rule ID — oracle leak", id)
+        }
+    }
+}
+```
+
+**Properties:**
+1. **Cryptographically random** — no sequential IDs
+2. **No rule ID leakage** — token does not encode which rule matched
+3. **Time-independent** — constant-time token generation
+
+### Defense: Timing Side-Channel Mitigation
+
+```go
+// tests/adversarial/oracle_test.go:66
+func TestOracle_TimingSideChannel(t *testing.T) {
+    // DENY and PERMIT latencies should be in the same order of magnitude
+    avgDeny := totalDeny / iterations
+    avgPermit := totalPermit / iterations
+
+    // Allow up to 10x difference (same ballpark)
+    if avgDeny > avgPermit*10 || avgPermit > avgDeny*10 {
+        t.Errorf("timing side-channel detected")
+    }
+}
+```
+
+**DENY and PERMIT execution paths are designed to have similar latency profiles.**
+
+### Defense: Error Message Uniformity
+
+```go
+// tests/adversarial/oracle_test.go:108
+func TestOracle_ErrorMessageUniformity(t *testing.T) {
+    // All denials look identical to the agent
+    for _, tool := range tools {
+        d := pipeline.Evaluate(testCAR(tool, nil))
+        
+        // No reason should contain implementation details
+        for _, leak := range []string{"sql", "database", "table", "regex"} {
+            if strings.Contains(strings.ToLower(d.Reason), leak) {
+                t.Errorf("reason leaks implementation detail %q", leak)
+            }
+        }
+    }
+}
+```
+
+<Info>
+  Denial reasons are **user-facing and generic** — they never leak rule structure, regex patterns, or SQL table names.
+</Info>
+
+---
+
+## Adversarial Test Suite
+
+Faramesh includes a **22-test adversarial suite** to detect regressions:
+
+```bash
+go test ./tests/adversarial/... -v
+```
+
+### Test Categories
+
+**Oracle Attack Tests** (`oracle_test.go`):
+- Denial token opacity
+- Timing side-channel resistance
+- Error message uniformity
+- Policy version probing
+
+**Policy Bypass Tests** (`bypass_test.go`):
+- Unicode normalization attacks
+- Path traversal in tool IDs
+- Arg injection via serialization
+- Race condition exploitation
+
+**Double-Guard Tests** (`doubleguard_test.go`):
+- WAL write failures → DENY
+- DPR chain breaks → system halt
+- Kill switch activation
+- Credential broker failures
+
+**Property-Based Tests** (`properties_test.go`):
+- Idempotency of decisions
+- Commutativity of rule order (first-match-wins)
+- Invariant: No execution without DPR record
+
+---
+
+## Security Best Practices
+
+### For Users
+
+<Steps>
+  <Step title="Keep Updated">
+    Always use the **latest version** to receive security patches.
+    ```bash
+    brew upgrade faramesh
+    ```
+  </Step>
+
+  <Step title="Use Authentication">
+    Set `FARAMESH_TOKEN` in production:
+    ```bash
+    export FARAMESH_TOKEN=$(openssl rand -hex 32)
+    faramesh serve --policy policy.yaml
+    ```
+  </Step>
+
+  <Step title="Secure Policies">
+    Protect policy files with file permissions:
+    ```bash
+    chmod 600 policy.yaml
+    chown faramesh:faramesh policy.yaml
+    ```
+  </Step>
+
+  <Step title="Database Security">
+    Use **PostgreSQL with TLS** for DPR persistence:
+    ```yaml
+    dpr:
+      backend: postgres
+      connection: postgres://user:pass@db:5432/faramesh?sslmode=require
+    ```
+  </Step>
+
+  <Step title="Network Security">
+    Use **HTTPS in production** and restrict network access:
+    ```yaml
+    server:
+      listen: unix:///var/run/faramesh.sock  # Unix socket (safest)
+      # OR
+      listen: 127.0.0.1:8080                 # localhost only
+    ```
+  </Step>
+
+  <Step title="Regular Audits">
+    Review DPR chain and approval decisions:
+    ```bash
+    faramesh audit tail --follow
+    faramesh audit verify ~/.faramesh/faramesh.db
+    ```
+  </Step>
+</Steps>
+
+### For Developers
+
+<Steps>
+  <Step title="Input Validation">
+    Always validate and sanitize inputs in custom scanners.
+  </Step>
+
+  <Step title="No Hardcoded Secrets">
+    Never commit tokens or passwords. Use credential brokers.
+  </Step>
+
+  <Step title="Dependency Updates">
+    Keep dependencies updated:
+    ```bash
+    go get -u ./...
+    go mod tidy
+    ```
+  </Step>
+
+  <Step title="Security Reviews">
+    Review code for security issues before merging.
+  </Step>
+
+  <Step title="Run Adversarial Tests">
+    Always run the adversarial suite:
+    ```bash
+    go test ./tests/adversarial/... -v -count=1
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Known Security Considerations
+
+### Current Limitations
+
+1. **No Rate Limiting**  
+   Faramesh doesn't implement rate limiting. Use a reverse proxy (nginx) or API gateway for rate limiting in production.
+
+2. **Policy File Security**  
+   Policy files are not encrypted. Protect with file system permissions.
+
+3. **Input Encryption**  
+   Inputs are not encrypted at rest. Use database encryption for sensitive data.
+
+4. **Shell Command Execution**  
+   If executors use `shell=True`, command sanitization is best-effort. Real security comes from approval workflows.
+
+5. **Single Policy File**  
+   Currently uses a single policy file. Multi-file policies may be added in the future.
+
+### Security Features
+
+<Accordion title="Deny-by-Default">
+  Actions are denied unless explicitly allowed by policy.
+</Accordion>
+
+<Accordion title="Input Validation">
+  All inputs are validated and sanitized before policy evaluation.
+</Accordion>
+
+<Accordion title="Command Sanitization">
+  Shell commands are sanitized to prevent injection attacks.
+</Accordion>
+
+<Accordion title="No Side Effects Until Approval">
+  Policy evaluation has no side effects — writes occur only after PERMIT/DEFER approval.
+</Accordion>
+
+<Accordion title="Optimistic Locking">
+  Prevents race conditions in DPR chain and session state.
+</Accordion>
+
+<Accordion title="Bearer Token Authentication">
+  Supports `Authorization: Bearer <token>` for HTTP endpoints.
+</Accordion>
+
+---
+
+## Reporting Vulnerabilities
+
+**Please do NOT open a public GitHub issue for security vulnerabilities.**
+
+### GitHub Security Advisory (Preferred)
+
+1. Go to: https://github.com/faramesh/faramesh-core/security/advisories/new
+2. Click "Report a vulnerability"
+3. Fill out the security advisory form
+4. Submit privately
+
+### Email
+
+Email: **security@faramesh.dev**
+
+### Response Timeline
+
+- **Acknowledgment**: Within 3 business days
+- **Initial Assessment**: Within 7 business days
+- **Update**: We'll keep you informed of remediation progress
+- **Resolution**: We'll work to resolve critical issues as quickly as possible
+
+---
+
+## Related
+
+- [Multi-Agent Governance](/advanced/multi-agent) — Sub-agent policies
+- [Observability](/advanced/observability) — Audit trail and DPR chain
+- [Policies](/policy/writing-policies) — Policy-as-code reference

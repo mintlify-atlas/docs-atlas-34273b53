@@ -1,0 +1,90 @@
+---
+title: CanonicalActionRequest
+description: The normalized representation of a tool call delivered by any adapter
+---
+
+## Overview
+
+The `CanonicalActionRequest` is the invariant type that flows through the decision pipeline identically regardless of which adapter (SDK, proxy, MCP, eBPF) delivers the request. All fields are set before the pipeline runs.
+
+<Info>
+The current Canonical Action Request specification version is `car/1.0` (defined as `CARVersion`).
+</Info>
+
+## Structure
+
+<ResponseField name="call_id" type="string" required>
+  A UUID v4 assigned by the adapter for idempotency tracking.
+</ResponseField>
+
+<ResponseField name="agent_id" type="string" required>
+  The identity of the agent making the call.
+  
+  <Note>
+  In A1 mode (SDK), this is self-reported. In production, it is infrastructure-injected and read from `/proc/1/environ`.
+  </Note>
+</ResponseField>
+
+<ResponseField name="session_id" type="string" required>
+  Groups calls within a single agent session. Used for session-level policy and audit correlation.
+</ResponseField>
+
+<ResponseField name="tool_id" type="string" required>
+  Identifies the tool being called, e.g. `"stripe/refund"` or `"github/create_issue"`.
+</ResponseField>
+
+<ResponseField name="args" type="object" required>
+  The raw arguments to the tool call. This is a free-form JSON object containing the parameters passed to the tool.
+</ResponseField>
+
+<ResponseField name="timestamp" type="time.Time" required>
+  When the adapter received the call. Used for time-based policy rules and audit ordering.
+</ResponseField>
+
+<ResponseField name="intercept_adapter" type="string" required>
+  Identifies which adapter delivered this request:
+  - `"sdk"` for A1 (SDK integration)
+  - `"proxy"` for A3 (HTTP proxy)
+  - `"mcp"` for A5 (Model Context Protocol)
+  - `"ebpf"` for A6 (kernel-level interception)
+</ResponseField>
+
+<ResponseField name="principal" type="principal.Identity" optional>
+  The invoking human or system identity.
+  
+  Policy rules can reference `principal.tier`, `principal.role`, `principal.org_id`, etc. to make authorization decisions based on who initiated the agent session.
+</ResponseField>
+
+<ResponseField name="delegation" type="principal.DelegationChain" optional>
+  The delegation chain if this is a delegated call.
+  
+  Policy rules can reference `delegation.depth`, `delegation.origin_org`, etc. to control cross-tenant agent delegation.
+</ResponseField>
+
+## Example
+
+```json
+{
+  "call_id": "550e8400-e29b-41d4-a716-446655440000",
+  "agent_id": "agent-prod-001",
+  "session_id": "session-abc123",
+  "tool_id": "stripe/refund",
+  "args": {
+    "charge_id": "ch_3NqH8TLkdIwHu7ix0O8p9yq9",
+    "amount": 5000,
+    "reason": "requested_by_customer"
+  },
+  "timestamp": "2026-03-14T10:30:00Z",
+  "intercept_adapter": "sdk",
+  "principal": {
+    "id": "user-789",
+    "tier": "enterprise",
+    "role": "admin"
+  }
+}
+```
+
+## Related Types
+
+- [Decision](/api/decision) - The output of the evaluation pipeline
+- [Effect](/api/effects) - The governance outcome constants

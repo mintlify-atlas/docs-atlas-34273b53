@@ -1,0 +1,296 @@
+---
+title: "faramesh audit"
+description: "Audit operations: live tail, verify, export, and analyze DPR records"
+---
+
+## Overview
+
+The `faramesh audit` command group provides tools for working with the Decision Provenance Record (DPR) chain: live streaming, chain integrity verification, compliance exports, and statistics.
+
+## Commands
+
+### `faramesh audit tail`
+
+Stream live governance decisions from a running daemon.
+
+```bash
+faramesh audit tail
+```
+
+**What it does:**
+- Connects to the running daemon via Unix socket
+- Subscribes to the decision stream
+- Prints each decision with color-coded effects
+
+**Example output:**
+```bash
+Faramesh Audit Tail — streaming decisions (Ctrl+C to stop)
+
+[10:15:32] PERMIT  get_exchange_rate      payment-bot       rule=allow-exchange  2ms
+[10:15:35] DENY    shell/run              ops-bot           rule=deny-shell  0ms
+[10:15:38] DEFER   stripe/refund          payment-bot       rule=defer-high-value  5ms
+[10:15:42] PERMIT  read_customer          crm-bot           rule=allow-read  1ms
+```
+
+**Flags:**
+
+<ParamField path="--agent" type="string">
+  Filter by agent ID. If empty, shows decisions from all agents.
+</ParamField>
+
+<ParamField path="--socket" type="string" default="/tmp/faramesh.sock">
+  Daemon Unix socket path.
+</ParamField>
+
+**Example: Filter by agent**
+```bash
+faramesh audit tail --agent payment-bot
+```
+
+<Note>
+  Press `Ctrl+C` to stop streaming. The daemon continues running.
+</Note>
+
+---
+
+### `faramesh audit verify`
+
+Verify the SHA256 chain integrity of a DPR SQLite store.
+
+```bash
+faramesh audit verify ~/.faramesh/faramesh.db
+```
+
+**What it does:**
+- Reads all DPR records from the SQLite database
+- Recomputes the `record_hash` for each record
+- Compares the computed hash with the stored hash
+- Reports any chain integrity violations
+
+**Example output:**
+```bash
+Verifying DPR chain integrity: /home/user/.faramesh/faramesh.db
+Records to verify: 1247
+
+✓ Chain integrity verified. 1247 records, 0 violations.
+```
+
+**Exit code:**
+- `0` if chain is intact
+- `1` if any violations detected
+
+<Warning>
+  If violations are detected, the DPR chain may have been tampered with or corrupted. Investigate immediately.
+</Warning>
+
+---
+
+### `faramesh audit export`
+
+Export DPR records for compliance (SOC2, HIPAA, PCI-DSS).
+
+```bash
+faramesh audit export data/dpr.db --format json > audit.json
+```
+
+**Formats:**
+- `json` — JSON array
+- `jsonl` — JSON Lines (one record per line)
+- `csv` — Comma-separated values
+
+**Example: Export to CSV**
+```bash
+faramesh audit export data/dpr.db --format csv > audit.csv
+```
+
+**Example: Filter by effect**
+```bash
+faramesh audit export data/dpr.db --effect DENY --format jsonl | jq '.reason_code'
+```
+
+**Example: Export with chain verification**
+```bash
+faramesh audit export data/dpr.db --verify --format json
+```
+
+**Flags:**
+
+<ParamField path="--format" type="string" default="json">
+  Output format: `json`, `jsonl`, or `csv`.
+</ParamField>
+
+<ParamField path="--agent" type="string">
+  Filter by agent ID.
+</ParamField>
+
+<ParamField path="--effect" type="string">
+  Filter by effect: `PERMIT`, `DENY`, `DEFER`, or `SHADOW`.
+</ParamField>
+
+<ParamField path="--since" type="string">
+  Only export records after this date. Accepts RFC3339 (`2024-01-15T10:00:00Z`) or date-only (`2024-01-15`).
+</ParamField>
+
+<ParamField path="--limit" type="number" default="10000">
+  Maximum records to export.
+</ParamField>
+
+<ParamField path="--verify" type="boolean" default="false">
+  Verify chain integrity during export. Prints a warning if violations are detected.
+</ParamField>
+
+**CSV Output:**
+
+The CSV format includes these columns:
+
+```csv
+record_id,created_at,agent_id,session_id,tool_id,effect,matched_rule_id,reason_code,reason,policy_version,intercept_adapter,record_hash,prev_record_hash
+```
+
+**JSONL Output:**
+
+Each line is a complete JSON object:
+
+```jsonl
+{"record_id":"rec-abc123","created_at":"2024-01-15T10:00:00Z","agent_id":"payment-bot",...}
+{"record_id":"rec-def456","created_at":"2024-01-15T10:01:00Z","agent_id":"payment-bot",...}
+```
+
+---
+
+### `faramesh audit stats`
+
+Show aggregate statistics from the DPR audit trail.
+
+```bash
+faramesh audit stats data/dpr.db
+```
+
+**Example output:**
+```bash
+DPR Audit Statistics — data/dpr.db
+  Total records : 1247
+  Unique agents : 3
+  Unique tools  : 18
+
+  Decisions by effect:
+    PERMIT   892
+    DENY     287
+    DEFER    68
+
+  Top deny reason codes:
+    DESTRUCTIVE_SHELL_COMMAND         143
+    HIGH_VALUE_REFUND                 52
+    MASS_EMAIL_LIMIT                  37
+    PII_EXPOSURE_RISK                 28
+    UNAPPROVED_API_ENDPOINT           15
+    BUDGET_EXCEEDED                   8
+    RATE_LIMIT_EXCEEDED               4
+```
+
+**Use cases:**
+- Understand agent behavior patterns
+- Identify the most common denial reasons
+- Track PERMIT/DENY/DEFER ratios over time
+- Generate compliance reports
+
+---
+
+## DPR Chain Structure
+
+Each DPR record includes:
+
+<ResponseField name="record_id" type="string" required>
+  Unique identifier for this decision record.
+</ResponseField>
+
+<ResponseField name="record_hash" type="string" required>
+  SHA256 hash of this record's canonical bytes.
+</ResponseField>
+
+<ResponseField name="prev_record_hash" type="string" required>
+  SHA256 hash of the previous record (linked list). Empty for the first record in the chain.
+</ResponseField>
+
+<ResponseField name="created_at" type="string" required>
+  Timestamp when the decision was made (RFC3339).
+</ResponseField>
+
+<ResponseField name="agent_id" type="string" required>
+  Agent identifier.
+</ResponseField>
+
+<ResponseField name="session_id" type="string" required>
+  Session identifier.
+</ResponseField>
+
+<ResponseField name="tool_id" type="string" required>
+  Tool identifier (e.g., `stripe/refund`, `shell/run`).
+</ResponseField>
+
+<ResponseField name="effect" type="string" required>
+  Decision effect: `PERMIT`, `DENY`, `DEFER`, or `SHADOW`.
+</ResponseField>
+
+<ResponseField name="matched_rule_id" type="string">
+  Policy rule that matched (empty if default_effect was used).
+</ResponseField>
+
+<ResponseField name="reason_code" type="string">
+  Machine-readable reason code (e.g., `HIGH_VALUE_REFUND`).
+</ResponseField>
+
+<ResponseField name="reason" type="string">
+  Human-readable reason.
+</ResponseField>
+
+<ResponseField name="policy_version" type="string" required>
+  Hash of the active policy at decision time.
+</ResponseField>
+
+<ResponseField name="intercept_adapter" type="string" required>
+  Adapter that intercepted the tool call (e.g., `sdk`, `daemon`, `sidecar`).
+</ResponseField>
+
+<ResponseField name="args_structural_sig" type="string">
+  Shape hash of arguments (never raw values). Used for pattern detection without exposing sensitive data.
+</ResponseField>
+
+---
+
+## Compliance Exports
+
+Faramesh DPR exports support common compliance frameworks:
+
+<CardGroup cols={2}>
+  <Card title="SOC 2 Type II" icon="shield-check">
+    Export DPR records to demonstrate security controls, access logging, and audit trails for SOC 2 compliance.
+  </Card>
+  <Card title="HIPAA" icon="hospital">
+    Generate audit logs for HIPAA-regulated healthcare data access and modification.
+  </Card>
+  <Card title="PCI-DSS" icon="credit-card">
+    Track payment-related operations for PCI-DSS Requirement 10 (audit trail).
+  </Card>
+  <Card title="GDPR" icon="shield">
+    Demonstrate data access governance and automated deletion controls for GDPR Article 30 (records of processing).
+  </Card>
+</CardGroup>
+
+**Example: SOC 2 Export**
+```bash
+# Export all DENY decisions from the last 90 days
+faramesh audit export data/dpr.db \
+  --effect DENY \
+  --since $(date -d '90 days ago' +%Y-%m-%d) \
+  --format csv \
+  --verify > soc2-audit-$(date +%Y%m%d).csv
+```
+
+---
+
+## Related Commands
+
+- [`faramesh serve`](/cli/serve) — Start the daemon (creates DPR records)
+- [`faramesh agent approve`](/cli/agent) — Approve a deferred action
+- [`faramesh policy replay`](/cli/policy) — Replay DPR records against a new policy

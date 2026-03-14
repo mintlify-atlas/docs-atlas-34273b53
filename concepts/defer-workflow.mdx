@@ -1,0 +1,478 @@
+---
+title: 'DEFER Workflow'
+description: 'Human-in-the-loop approval for high-stakes actions'
+---
+
+## Overview
+
+The **DEFER workflow** enables human-in-the-loop governance: when a policy rule returns `effect: defer`, the tool call **pauses** and waits for human approval before proceeding.
+
+<Info>
+DEFER is not a deny — it's a **parking state**. The agent's SDK polls for approval resolution. When approved, execution continues. When denied or expired, the call fails.
+</Info>
+
+## How It Works
+
+<Steps>
+  <Step title="Policy Evaluation">
+    A rule matches with `effect: defer`:
+    ```yaml
+    - id: defer-high-value-refund
+      match:
+        tool: stripe/refund
+        when: 'args["amount"] > vars["max_refund"]'
+      effect: defer
+      reason: refund exceeds threshold — requires finance approval
+    ```
+  </Step>
+  
+  <Step title="Decision Returned">
+    The pipeline returns a `DEFER` decision with:
+    - `defer_token` — Unique token for this approval (e.g., `"a3f5b2c8"`)
+    - `defer_expires_at` — Auto-deny deadline (default: 5 minutes)
+    - `defer_poll_interval_secs` — Suggested poll interval (default: 2 seconds)
+  </Step>
+  
+  <Step title="SDK Blocks">
+    The SDK enters **DeferPollLoop**:
+    ```python
+    # SDK polls every 2 seconds
+    while not expired:
+        status = check_approval(defer_token)
+        if status == "approved":
+            return execute_tool()
+        elif status == "denied":
+            raise DeferDeniedError()
+        sleep(2)
+    raise DeferExpiredError()
+    ```
+  </Step>
+  
+  <Step title="Notification Sent">
+    Faramesh sends approval request to configured channel:
+    - **Slack**: Webhook with approval/deny buttons
+    - **Terminal**: Printed to daemon logs
+    - **PagerDuty**: Incident with approval actions
+    - **Webhook**: POST to custom endpoint
+  </Step>
+  
+  <Step title="Human Decides">
+    Operator runs:
+    ```bash
+    faramesh agent approve a3f5b2c8
+    # or
+    faramesh agent deny a3f5b2c8 --reason "invalid customer"
+    ```
+  </Step>
+  
+  <Step title="SDK Unblocks">
+    Next poll detects resolution:
+    - **Approved** → Tool executes, result returned to agent
+    - **Denied** → `DeferDeniedError` raised
+    - **Expired** → `DeferExpiredError` raised after timeout
+  </Step>
+</Steps>
+
+## DEFER in Python SDK
+
+```python
+from faramesh import govern, DeferredError
+
+governed_refund = govern(stripe_refund, policy='payment.yaml', agent_id='payment-bot')
+
+try:
+    result = governed_refund(amount=12000, currency='usd')
+    print(f"Refund succeeded: {result}")
+except DeferredError as e:
+    if e.expired:
+        print(f"DEFER expired: {e.reason}")
+    else:
+        print(f"DEFER denied: {e.reason}")
+    print(f"Token was: {e.defer_token}")
+```
+
+### DeferredError Fields
+
+```python
+class DeferredError(Exception):
+    defer_token: str      # Token for manual approval
+    reason: str           # Why it was deferred/denied
+    expired: bool         # True if timeout, False if denied
+    defer_deadline: str   # ISO 8601 expiry timestamp
+```
+
+## Approval Commands
+
+### Approve
+
+```bash
+faramesh agent approve <defer-token>
+```
+
+Example:
+```bash
+faramesh agent approve a3f5b2c8
+```
+
+Output:
+```
+✓ DEFER a3f5b2c8 approved. Agent will resume execution.
+```
+
+### Deny
+
+```bash
+faramesh agent deny <defer-token> --reason "invalid request"
+```
+
+Example:
+```bash
+faramesh agent deny a3f5b2c8 --reason "customer account is frozen"
+```
+
+Output:
+```
+✓ DEFER a3f5b2c8 denied. Agent will receive DeferDeniedError.
+```
+
+### List Pending
+
+Show all pending DEFERs:
+
+```bash
+faramesh agent pending
+```
+
+Output:
+```
+Token     Agent        Tool             Reason                              Expires
+a3f5b2c8  payment-bot  stripe/refund    High-value refund requires approval  in 4m 23s
+b7e1f4a2  email-bot    send_email       Mass email to 1,247 recipients       in 2m 51s
+```
+
+## Timeout Behavior
+
+Default timeout: **5 minutes**
+
+From [workflow.go:16](https://github.com/faramesh/faramesh-core/blob/main/internal/core/defer/workflow.go:16):
+
+```go
+const DefaultTimeout = 5 * time.Minute
+```
+
+After timeout:
+1. DEFER status changes to `expired`
+2. Next SDK poll receives `status: expired`
+3. SDK raises `DeferExpiredError` with `expired=True`
+4. Tool call fails
+
+### Custom Timeout
+
+Configure per-rule timeout:
+
+```yaml
+- id: defer-critical-action
+  match:
+    tool: drop_database
+  effect: defer
+  reason: requires VP Engineering approval
+  defer_timeout_secs: 1800  # 30 minutes
+```
+
+## Notification Channels
+
+### Slack
+
+Configure Slack webhook in policy:
+
+```yaml
+webhooks:
+  url: https://hooks.slack.com/services/T00/B00/XXX
+  events: [defer, defer_resolved]
+  secret: your-hmac-secret
+```
+
+Slack message format:
+```
+🟡 Faramesh DEFER | Agent: payment-bot | Tool: stripe/refund
+> Refund exceeds threshold — requires finance approval
+
+Token: a3f5b2c8 | Expires: 10:28:45
+
+Approve: faramesh agent approve a3f5b2c8
+Deny:    faramesh agent deny a3f5b2c8
+```
+
+See [workflow.go:229-244](https://github.com/faramesh/faramesh-core/blob/main/internal/core/defer/workflow.go:229) for the implementation.
+
+### Terminal
+
+When no webhook is configured, DEFER requests print to daemon logs:
+
+```
+[10:23:45] DEFER a3f5b2c8 | payment-bot | stripe/refund | amount=$12,000
+           Reason: refund exceeds threshold — requires finance approval
+           Approve: faramesh agent approve a3f5b2c8
+           Deny:    faramesh agent deny a3f5b2c8
+           Expires: 10:28:45
+```
+
+### Custom Webhook
+
+Receive DEFER events at your endpoint:
+
+```yaml
+webhooks:
+  url: https://api.example.com/faramesh/defer
+  events: [defer]
+  secret: your-hmac-secret
+  timeout_ms: 5000
+```
+
+Payload:
+```json
+{
+  "event": "defer",
+  "defer_token": "a3f5b2c8",
+  "agent_id": "payment-bot",
+  "tool_id": "stripe/refund",
+  "reason": "refund exceeds threshold — requires finance approval",
+  "reason_code": "HIGH_VALUE_REFUND",
+  "args_structural_sig": "e2a1f9c3b5d7a0e3",
+  "expires_at": "2026-03-14T10:28:45Z",
+  "created_at": "2026-03-14T10:23:45Z"
+}
+```
+
+## DeferPollLoop Implementation
+
+From [workflow.go:74-116](https://github.com/faramesh/faramesh-core/blob/main/internal/core/defer/workflow.go:74):
+
+```go
+// DeferWithToken creates a new deferred handle with a specific token.
+// If a handle with this token already exists, the existing handle is returned
+// and no duplicate is created. This prevents double-registration.
+func (w *Workflow) DeferWithToken(token, agentID, toolID, reason string) (*Handle, error) {
+    w.mu.Lock()
+    if h, ok := w.pending[token]; ok {
+        w.mu.Unlock()
+        return h, nil // already exists — idempotent
+    }
+
+    h := &Handle{
+        Token:     token,
+        AgentID:   agentID,
+        ToolID:    toolID,
+        Reason:    reason,
+        CreatedAt: time.Now(),
+        Deadline:  time.Now().Add(DefaultTimeout),
+        ch:        make(chan Resolution, 1),
+    }
+    w.pending[token] = h
+    w.mu.Unlock()
+
+    // Start expiry goroutine
+    go func() {
+        select {
+        case <-time.After(time.Until(h.Deadline)):
+            res := Resolution{Approved: false, Reason: "expired", Status: StatusExpired}
+            w.mu.Lock()
+            delete(w.pending, token)
+            w.resolved[token] = &resolvedHandle{resolution: res}
+            w.mu.Unlock()
+            select {
+            case h.ch <- res:
+            default:
+            }
+        case <-h.ch:
+        }
+    }()
+
+    return h, nil
+}
+```
+
+The SDK polls `check_approval(token)` every 2 seconds. The daemon's `/defer/status` endpoint returns:
+
+```json
+{
+  "status": "pending",  // or "approved", "denied", "expired"
+  "pending": true
+}
+```
+
+When resolved, `status` changes and `pending` becomes `false`.
+
+## Real Example from demo.yaml
+
+From [demo.yaml:48-57](https://github.com/faramesh/faramesh-core/blob/main/policies/demo.yaml:48):
+
+```yaml
+# Require human approval for high-value refunds.
+- id: defer-high-value-refund
+  match:
+    tool: stripe/refund
+    when: 'args["amount"] > vars["max_refund"]'
+  effect: defer
+  reason: refund exceeds threshold and requires finance approval
+  reason_code: HIGH_VALUE_REFUND
+  incident_category: financial_threshold
+  incident_severity: high
+```
+
+With `vars.max_refund: 500`, this triggers DEFER for any refund over $500.
+
+### Demo Flow
+
+```bash
+# Terminal 1: Start daemon with demo policy
+faramesh serve --policy demo.yaml
+
+# Terminal 2: Run agent that triggers DEFER
+python agent.py
+```
+
+Agent code:
+```python
+from faramesh import govern
+import stripe
+
+governed_refund = govern(stripe.Refund.create, policy='demo.yaml', agent_id='payment-bot')
+
+# This triggers DEFER (amount > 500)
+try:
+    refund = governed_refund(amount=12000, currency='usd')
+except DeferredError as e:
+    print(f"Awaiting approval: {e.defer_token}")
+    print(f"Expires: {e.defer_deadline}")
+    # SDK is polling in background...
+```
+
+Daemon logs:
+```
+[10:23:45] DEFER a3f5b2c8 | payment-bot | stripe/refund | amount=$12,000
+           Approve: faramesh agent approve a3f5b2c8
+```
+
+Approve:
+```bash
+# Terminal 3
+faramesh agent approve a3f5b2c8
+```
+
+Agent output:
+```
+Refund succeeded: Refund(id='re_abc123', amount=12000, status='succeeded')
+```
+
+## DEFER Triage (Advanced)
+
+Configure priority tiers for DEFER events:
+
+```yaml
+defer_priority:
+  critical:
+    criteria: 'tool.blast_radius == "external" && args["amount"] > 50000'
+    sla_seconds: 300
+    channel: pagerduty
+    escalation_after_seconds: 180
+    auto_deny_after_seconds: 600
+  
+  high:
+    criteria: 'args["amount"] > 5000'
+    sla_seconds: 900
+    channel: slack
+    escalation_after_seconds: 600
+    auto_deny_after_seconds: 1800
+  
+  normal:
+    criteria: 'true'
+    sla_seconds: 3600
+    channel: email
+    auto_deny_after_seconds: 7200
+```
+
+See [schema.go:237-251](https://github.com/faramesh/faramesh-core/blob/main/internal/core/policy/schema.go:237) for the schema.
+
+## Conditional Approval
+
+Approve with modified arguments:
+
+```bash
+faramesh agent approve a3f5b2c8 --modify-args '{"amount": 5000}'
+```
+
+This:
+1. Approves the DEFER
+2. Replaces `args["amount"]` with `5000`
+3. Re-evaluates the policy with modified args
+4. If new evaluation is PERMIT → executes with new args
+5. If new evaluation is DENY/DEFER → agent receives the new decision
+
+From [workflow.go:158-189](https://github.com/faramesh/faramesh-core/blob/main/internal/core/defer/workflow.go:158):
+
+```go
+func (w *Workflow) ResolveWithModifiedArgs(token string, reason string, modifiedArgs map[string]any) error {
+    // ...
+    res := Resolution{
+        Approved:     true,
+        Reason:       reason,
+        Status:       StatusApproved,
+        ModifiedArgs: modifiedArgs,  // SDK re-validates with these args
+    }
+    // ...
+}
+```
+
+## DEFER Resolution Tracking
+
+Every DEFER resolution is recorded in the DPR chain:
+
+```json
+{
+  "record_id": "550e8400-...",
+  "effect": "DEFER_RESOLVED",
+  "matched_rule_id": "defer-high-value-refund",
+  "defer_token": "a3f5b2c8",
+  "defer_resolution": "approved",
+  "resolved_by_principal": "admin@company.com",
+  "resolution_reason": "Verified with customer support",
+  "created_at": "2026-03-14T10:25:12Z"
+}
+```
+
+This creates an audit trail of:
+1. When the DEFER was triggered
+2. Who approved/denied it
+3. Why they approved/denied
+4. Whether it expired
+
+## Batch Approval
+
+Approve multiple DEFERs at once:
+
+```bash
+faramesh agent approve-batch a3f5b2c8 b7e1f4a2 c9d2f5e8
+```
+
+Or approve all DEFERs for a specific agent:
+
+```bash
+faramesh agent approve-all --agent-id payment-bot
+```
+
+<Warning>
+Batch approval should only be used when all requests have been individually reviewed. Do not blindly approve batches.
+</Warning>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Policy Engine" icon="file-code" href="/concepts/policy-engine">
+    Learn how to write policies that trigger DEFER.
+  </Card>
+  
+  <Card title="Adapters" icon="puzzle-piece" href="/concepts/adapters">
+    Understand how different adapters handle DEFER polling.
+  </Card>
+</CardGroup>

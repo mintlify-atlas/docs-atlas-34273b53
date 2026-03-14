@@ -1,0 +1,235 @@
+---
+title: "faramesh serve"
+description: "Start the Faramesh governance daemon"
+---
+
+## Overview
+
+The `faramesh serve` command starts the governance daemon. Agents connect via a Unix socket to submit tool calls and receive PERMIT/DENY/DEFER decisions. The daemon loads the policy file, opens the WAL and SQLite DPR store, and starts accepting connections.
+
+```bash
+faramesh serve --policy policy.yaml
+```
+
+## What It Does
+
+When `faramesh serve` starts, it:
+
+1. **Loads the policy** from the specified YAML file
+2. **Compiles the policy** using the expr-lang engine
+3. **Opens the WAL** (write-ahead log) for durable audit records
+4. **Initializes the DPR store** (SQLite database for the Decision Provenance Record chain)
+5. **Binds the Unix socket** (default: `/tmp/faramesh.sock`)
+6. **Accepts connections** from agents via SDK shim, daemon adapter, or other integrations
+7. **Streams DPR records to Faramesh Horizon** (if `--sync-horizon` is enabled)
+
+## Flags
+
+<ParamField path="--policy" type="string" default="policy.yaml">
+  Path to the policy YAML file. Required.
+</ParamField>
+
+<ParamField path="--data-dir" type="string" default="$TMPDIR/faramesh">
+  Directory for WAL and DPR SQLite database. Defaults to a temporary directory.
+</ParamField>
+
+<ParamField path="--socket" type="string" default="/tmp/faramesh.sock">
+  Unix socket path for agent connections.
+</ParamField>
+
+<ParamField path="--slack-webhook" type="string">
+  Slack webhook URL for DEFER notifications. When an action is deferred, Faramesh posts a message to this webhook with the approval token.
+</ParamField>
+
+<ParamField path="--log-level" type="string" default="info">
+  Log level: `debug`, `info`, `warn`, or `error`.
+</ParamField>
+
+<ParamField path="--sync-horizon" type="boolean" default="false">
+  Stream DPR records to Faramesh Horizon cloud for fleet management, compliance exports, and observability. Requires authentication: `faramesh auth login`.
+</ParamField>
+
+## Example Usage
+
+<CodeGroup>
+
+```bash Basic
+faramesh serve --policy policy.yaml
+```
+
+```bash With Slack Notifications
+faramesh serve --policy policy.yaml \
+  --slack-webhook https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXX
+```
+
+```bash With Horizon Sync
+faramesh auth login
+faramesh serve --policy policy.yaml --sync-horizon
+```
+
+```bash Custom Socket and Data Directory
+faramesh serve --policy policy.yaml \
+  --socket /var/run/faramesh/faramesh.sock \
+  --data-dir /var/lib/faramesh
+```
+
+```bash Debug Mode
+faramesh serve --policy policy.yaml --log-level debug
+```
+
+</CodeGroup>
+
+## Daemon Startup Process
+
+The daemon initializes in this order (from `serve.go:48`):
+
+```go
+1. Build logger (zap)
+2. Load Horizon credentials (if --sync-horizon)
+3. Initialize daemon config:
+   - PolicyPath
+   - DataDir
+   - SocketPath
+   - SlackWebhook
+   - HorizonToken, HorizonURL, HorizonOrgID
+4. daemon.New(cfg) creates:
+   - Policy engine
+   - WAL
+   - DPR SQLite store
+   - Session manager
+   - DEFER workflow
+   - Pipeline
+5. daemon.Run(ctx) starts:
+   - Unix socket listener
+   - Connection handler goroutines
+   - DPR replication to Horizon (if enabled)
+```
+
+## Socket Protocol
+
+Agents connect to the Unix socket and send JSON-encoded requests:
+
+```json
+{
+  "type": "evaluate",
+  "call_id": "call-abc123",
+  "agent_id": "payment-bot",
+  "session_id": "session-xyz",
+  "tool_id": "stripe/refund",
+  "args": {
+    "amount": 500,
+    "currency": "usd"
+  },
+  "timestamp": "2024-01-15T10:30:00Z"
+}
+```
+
+The daemon responds with:
+
+```json
+{
+  "effect": "PERMIT",
+  "rule_id": "allow-small-refunds",
+  "reason": "refund under threshold",
+  "reason_code": "UNDER_THRESHOLD",
+  "latency_ms": 2
+}
+```
+
+<Note>
+  For DEFER decisions, the response includes a `defer_token` that can be used with `faramesh agent approve` or `faramesh agent deny`.
+</Note>
+
+## WAL and DPR Initialization
+
+Faramesh uses a **WAL-first architecture** to ensure no decision is returned without a durable audit record:
+
+1. **WAL write** — Decision is written to the write-ahead log and `fsync`'d to disk
+2. **Return decision** — Decision is returned to the agent
+3. **Async replication** — WAL entry is replicated to SQLite DPR store and Horizon (if enabled)
+
+If the WAL write fails, the decision is changed to `DENY` and an error is logged.
+
+## Horizon Sync
+
+To stream DPR records to Faramesh Horizon:
+
+```bash
+# 1. Authenticate
+faramesh auth login
+
+# 2. Start the daemon with --sync-horizon
+faramesh serve --policy policy.yaml --sync-horizon
+```
+
+The daemon will:
+- Verify the Horizon token on startup
+- Stream DPR records to Horizon in real time
+- Log the organization and user email
+
+<Warning>
+  If the Horizon token is expired or invalid, the daemon will fail to start. Run `faramesh auth login` to re-authenticate.
+</Warning>
+
+## Graceful Shutdown
+
+The daemon handles `SIGINT` and `SIGTERM` gracefully:
+
+1. Stop accepting new connections
+2. Wait for in-flight requests to complete (up to 5 seconds)
+3. Flush WAL to disk
+4. Close DPR store
+5. Close Unix socket
+
+## Monitoring
+
+While the daemon is running, use these commands to monitor it:
+
+- **Live decisions**: `faramesh audit tail`
+- **Chain integrity**: `faramesh audit verify ~/.faramesh/faramesh.db`
+- **Statistics**: `faramesh audit stats ~/.faramesh/faramesh.db`
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Socket bind error: address already in use">
+    Another Faramesh daemon or process is already using the socket. Stop the existing daemon or use a different socket path:
+    ```bash
+    faramesh serve --policy policy.yaml --socket /tmp/faramesh-2.sock
+    ```
+  </Accordion>
+
+  <Accordion title="Policy file not found">
+    Ensure the policy file path is correct and the file exists:
+    ```bash
+    ls -la policy.yaml
+    faramesh serve --policy $(pwd)/policy.yaml
+    ```
+  </Accordion>
+
+  <Accordion title="Horizon sync failing">
+    Check your Horizon authentication:
+    ```bash
+    faramesh auth status
+    ```
+    If expired, re-authenticate:
+    ```bash
+    faramesh auth login
+    ```
+  </Accordion>
+
+  <Accordion title="Permission denied writing to data directory">
+    Ensure the data directory is writable:
+    ```bash
+    mkdir -p ~/.faramesh
+    chmod 755 ~/.faramesh
+    faramesh serve --policy policy.yaml --data-dir ~/.faramesh
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Related Commands
+
+- [`faramesh policy validate`](/cli/policy) — Validate a policy file before serving
+- [`faramesh audit tail`](/cli/audit) — Stream live decisions
+- [`faramesh auth login`](/cli/auth) — Authenticate with Horizon

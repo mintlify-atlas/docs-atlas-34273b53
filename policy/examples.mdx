@@ -1,0 +1,579 @@
+---
+title: Policy Examples
+description: Real-world Faramesh policy examples and patterns
+---
+
+This page provides real-world policy examples from production Faramesh deployments. Use these as templates for your own policies.
+
+## Complete Demo Policy
+
+This is the reference demo policy from the Faramesh repository. It demonstrates common patterns for financial, shell, and communication tools.
+
+```yaml
+faramesh-version: '1.0'
+agent-id: demo-agent
+default_effect: permit
+
+vars:
+  max_refund: 500
+  max_email_recipients: 50
+  allowed_domains:
+    - internal.example.com
+    - api.company.com
+
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial]
+  shell/run:
+    reversibility: irreversible
+    blast_radius: local
+    shadow_safe: false
+    tags: [system]
+  send_email:
+    reversibility: irreversible
+    blast_radius: external
+    shadow_safe: false
+    tags: [communication]
+  read_customer:
+    reversibility: read_only
+    blast_radius: none
+    tags: [pii_source]
+  get_exchange_rate:
+    reversibility: read_only
+    blast_radius: none
+
+rules:
+  # Deny destructive shell commands before they run.
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs" || args["cmd"] matches "dd if="'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+    incident_category: destructive_command
+    incident_severity: critical
+
+  # Require human approval for high-value refunds.
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold and requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+    incident_category: financial_threshold
+    incident_severity: high
+
+  # Deny mass email operations without approval.
+  - id: deny-mass-email
+    match:
+      tool: send_email
+      when: 'len(args["recipients"]) > vars["max_email_recipients"]'
+    effect: deny
+    reason: mass email to more than 50 recipients requires manual review
+    reason_code: MASS_EMAIL_LIMIT
+    incident_category: mass_operation
+    incident_severity: medium
+
+  # Permit normal refunds under the threshold.
+  - id: permit-normal-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] <= vars["max_refund"]'
+    effect: permit
+    reason: refund within authorized threshold
+    reason_code: WITHIN_THRESHOLD
+```
+
+## Pattern: Blocking Destructive Shell Commands
+
+Prevent agents from executing dangerous shell commands:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: shell-guardian
+default_effect: defer
+
+tools:
+  shell/run:
+    reversibility: irreversible
+    blast_radius: local
+    shadow_safe: false
+    tags: [system]
+
+rules:
+  # Block recursive delete
+  - id: deny-rm-rf
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]"'
+    effect: deny
+    reason: recursive delete blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+    incident_severity: critical
+  
+  # Block filesystem formatting
+  - id: deny-mkfs
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "mkfs"'
+    effect: deny
+    reason: filesystem formatting blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+    incident_severity: critical
+  
+  # Block disk wiping
+  - id: deny-dd
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "dd\\s+if="'
+    effect: deny
+    reason: disk operations blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+    incident_severity: critical
+  
+  # Block shutdown/reboot
+  - id: deny-shutdown
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "shutdown|reboot|halt"'
+    effect: deny
+    reason: system shutdown blocked by policy
+    reason_code: SYSTEM_SHUTDOWN_DENIED
+    incident_severity: high
+  
+  # All other shell commands require approval
+  - id: defer-shell-exec
+    match:
+      tool: shell/*
+    effect: defer
+    reason: shell commands require human approval
+    reason_code: SHELL_REQUIRES_APPROVAL
+```
+
+<Note>
+  Use double backslashes (`\\`) in YAML regex patterns to properly escape regex metacharacters.
+</Note>
+
+## Pattern: High-Value Refund Approval
+
+Require human approval for refunds above a threshold:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: payment-agent
+default_effect: deny
+
+vars:
+  tier1_threshold: 100
+  tier2_threshold: 500
+  tier3_threshold: 5000
+
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial]
+    cost_usd: 0.25
+  stripe/get_charge:
+    reversibility: read_only
+    blast_radius: none
+    shadow_safe: true
+
+rules:
+  # Allow read-only charge lookups
+  - id: permit-charge-lookup
+    match:
+      tool: stripe/get_charge
+    effect: permit
+    reason: read-only charge lookup
+  
+  # Tier 3: Refunds over $5000 require senior approval
+  - id: defer-tier3-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["tier3_threshold"]'
+    effect: defer
+    reason: refund over $5000 requires CFO approval
+    reason_code: HIGH_VALUE_REFUND_TIER3
+    incident_category: financial_threshold
+    incident_severity: critical
+  
+  # Tier 2: Refunds $500-$5000 require manager approval
+  - id: defer-tier2-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["tier2_threshold"]'
+    effect: defer
+    reason: refund over $500 requires manager approval
+    reason_code: HIGH_VALUE_REFUND_TIER2
+    incident_category: financial_threshold
+    incident_severity: high
+  
+  # Tier 1: Refunds $100-$500 auto-approved with notification
+  - id: permit-tier1-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["tier1_threshold"]'
+    effect: permit
+    reason: refund within tier 1 threshold
+    reason_code: REFUND_TIER1
+    incident_category: financial_threshold
+    incident_severity: medium
+  
+  # Small refunds under $100 auto-approved
+  - id: permit-small-refund
+    match:
+      tool: stripe/refund
+    effect: permit
+    reason: small refund auto-approved
+    reason_code: SMALL_REFUND
+```
+
+## Pattern: Mass Email Prevention
+
+Prevent agents from sending emails to too many recipients:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: email-agent
+default_effect: deny
+
+vars:
+  max_recipients: 50
+  max_external_recipients: 10
+  internal_domain: "company.com"
+
+tools:
+  send_email:
+    reversibility: irreversible
+    blast_radius: external
+    shadow_safe: false
+    tags: [communication]
+
+rules:
+  # Deny mass emails
+  - id: deny-mass-email
+    match:
+      tool: send_email
+      when: 'len(args["recipients"]) > vars["max_recipients"]'
+    effect: deny
+    reason: mass email to more than 50 recipients requires manual review
+    reason_code: MASS_EMAIL_LIMIT
+    incident_category: mass_operation
+    incident_severity: medium
+  
+  # Defer emails with many external recipients
+  - id: defer-external-email
+    match:
+      tool: send_email
+      when: |
+        len([r for r in args["recipients"] if !contains(r, vars["internal_domain"])]) > vars["max_external_recipients"]
+    effect: defer
+    reason: email with more than 10 external recipients requires approval
+    reason_code: EXTERNAL_EMAIL_LIMIT
+  
+  # Permit internal emails
+  - id: permit-internal-email
+    match:
+      tool: send_email
+    effect: permit
+    reason: internal email permitted
+    reason_code: INTERNAL_EMAIL
+```
+
+## Pattern: PII Scanning
+
+Detect and block data exfiltration by scanning for PII in outbound calls:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: data-protection-agent
+default_effect: permit
+
+tools:
+  http/post:
+    reversibility: irreversible
+    blast_radius: external
+    shadow_safe: false
+    tags: [network]
+  read_customer:
+    reversibility: read_only
+    blast_radius: none
+    tags: [pii_source]
+
+rules:
+  # Defer HTTP POST if customer data was accessed recently
+  - id: defer-post-after-pii-read
+    match:
+      tool: http/post
+      when: 'history_contains_within("read_customer", 300)'
+    effect: defer
+    reason: HTTP POST blocked - customer data accessed in last 5 minutes
+    reason_code: PII_EXFILTRATION_RISK
+    incident_category: data_exfiltration
+    incident_severity: high
+  
+  # Block POST with PII patterns in payload
+  - id: deny-pii-in-payload
+    match:
+      tool: http/post
+      when: |
+        args["body"] matches "\\d{3}-\\d{2}-\\d{4}" ||
+        args["body"] matches "\\d{16}" ||
+        args["body"] matches "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"
+    effect: deny
+    reason: payload contains potential PII (SSN, credit card, or email)
+    reason_code: PII_DETECTED_IN_PAYLOAD
+    incident_category: pii_exposure
+    incident_severity: critical
+```
+
+<Warning>
+  PII detection via regex is basic. For production use, integrate with dedicated PII scanning tools or use Faramesh's built-in PII scanner (if available).
+</Warning>
+
+## Pattern: Budget Enforcement
+
+Enforce cost limits at session and daily levels:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: cost-controlled-agent
+default_effect: permit
+
+tools:
+  openai/gpt4:
+    reversibility: irreversible
+    blast_radius: external
+    tags: [llm]
+    cost_usd: 0.03
+  anthropic/claude:
+    reversibility: irreversible
+    blast_radius: external
+    tags: [llm]
+    cost_usd: 0.025
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    tags: [financial]
+    cost_usd: 0.25
+
+budget:
+  daily_usd: 100.00
+  session_usd: 10.00
+  max_calls: 500
+  on_exceed: defer
+
+vars:
+  max_refund_per_session: 1000
+
+rules:
+  # Defer if session refund total would exceed limit
+  - id: defer-session-refund-limit
+    match:
+      tool: stripe/refund
+      when: 'session.cost_usd + args["amount"] > vars["max_refund_per_session"]'
+    effect: defer
+    reason: session refund budget would be exceeded
+    reason_code: SESSION_REFUND_LIMIT
+    incident_category: budget_limit
+    incident_severity: medium
+  
+  # Warn on high LLM usage
+  - id: defer-llm-burst
+    match:
+      tool: "openai/*"
+      when: 'history_tool_count("openai/*") + history_tool_count("anthropic/*") > 20'
+    effect: defer
+    reason: LLM call rate is unusually high in this session
+    reason_code: LLM_RATE_ANOMALY
+```
+
+<Note>
+  The `budget` section is enforced **before** rule evaluation. If the budget is exceeded, the configured `on_exceed` effect is applied immediately.
+</Note>
+
+## Pattern: Sequence-Based Detection
+
+Detect multi-step attack patterns using history functions:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: exfil-monitor
+default_effect: permit
+
+rules:
+  # DATA EXFILTRATION PATTERN
+  # Defer delete if data was sent externally in the last 2 minutes
+  - id: defer-delete-after-exfil
+    match:
+      tool: "delete_*"
+      when: 'history_contains_within("http/post", 120)'
+    effect: defer
+    reason: delete blocked - data was sent to external endpoint in the last 2 minutes
+    reason_code: SEQUENCE_EXFIL_DETECTED
+    incident_category: data_exfiltration
+    incident_severity: high
+  
+  # CREDENTIAL ACCESS → OUTBOUND SEQUENCE
+  # Defer HTTP call if secrets were accessed earlier in session
+  - id: defer-http-after-secret-access
+    match:
+      tool: "http/*"
+      when: 'history_contains_within("secrets/*", 300) || history_contains_within("vault/*", 300)'
+    effect: defer
+    reason: outbound HTTP blocked - credential access occurred in this session
+    reason_code: SEQUENCE_SECRET_LEAK_RISK
+    incident_category: credential_exfiltration
+    incident_severity: critical
+  
+  # READ → SHELL → OUTBOUND FULL SEQUENCE
+  # Deny shell/exec if session has already done read_file AND http/post
+  - id: deny-shell-in-exfil-sequence
+    match:
+      tool: "shell/*"
+      when: 'history_sequence("read_file", "http/post")'
+    effect: deny
+    reason: shell execution denied - session exhibits read-then-exfil pattern
+    reason_code: SEQUENCE_TRAJECTORY_DANGEROUS
+    incident_category: data_exfiltration
+    incident_severity: critical
+  
+  # RATE ANOMALY: too many Stripe calls in one session
+  - id: defer-stripe-burst
+    match:
+      tool: "stripe/*"
+      when: 'history_tool_count("stripe/*") >= 5'
+    effect: defer
+    reason: Stripe call rate anomaly - more than 5 calls in current session
+    reason_code: SEQUENCE_RATE_ANOMALY
+    incident_category: rate_anomaly
+    incident_severity: medium
+```
+
+This demonstrates Faramesh's powerful **sequence-aware governance** using:
+- `history_contains_within(pattern, seconds)` — Check if a tool was called recently
+- `history_sequence(tool_a, tool_b, ...)` — Verify tools appeared in order
+- `history_tool_count(pattern)` — Count matching calls in history
+
+## Pattern: Time-Based Restrictions
+
+Restrict operations to business hours or specific days:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: time-restricted-agent
+default_effect: permit
+
+vars:
+  business_hours_start: 9
+  business_hours_end: 17
+
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    tags: [financial]
+  deploy/production:
+    reversibility: irreversible
+    blast_radius: system
+    tags: [deployment]
+
+rules:
+  # Defer weekend deployments
+  - id: defer-weekend-deploy
+    match:
+      tool: deploy/production
+      when: 'time.weekday > 5'
+    effect: defer
+    reason: production deployments require approval on weekends
+    reason_code: WEEKEND_DEPLOY
+    incident_severity: high
+  
+  # Defer after-hours refunds
+  - id: defer-after-hours-refund
+    match:
+      tool: stripe/refund
+      when: 'time.hour < vars["business_hours_start"] || time.hour >= vars["business_hours_end"]'
+    effect: defer
+    reason: refunds outside business hours require approval
+    reason_code: AFTER_HOURS_REFUND
+  
+  # Permit during business hours
+  - id: permit-business-hours
+    match:
+      tool: "*"
+    effect: permit
+    reason: operation permitted during business hours
+```
+
+<Note>
+  Time context uses **UTC**. Adjust thresholds for your timezone or use `time.hour + offset` in conditions.
+</Note>
+
+## Default Deny Template
+
+A secure starting point for new policies:
+
+```yaml
+faramesh-version: "1.0"
+agent-id: "secure-agent"
+default_effect: deny
+
+tools:
+  # Declare your tools here
+
+rules:
+  # Explicitly permit known-safe read-only operations
+  - id: allow-http-get
+    match:
+      tool: http/get
+    effect: permit
+    reason: safe read-only HTTP GET
+  
+  - id: allow-database-read
+    match:
+      tool: db/select
+    effect: permit
+    reason: safe read-only database query
+  
+  # Defer high-risk operations for approval
+  - id: defer-shell
+    match:
+      tool: shell/*
+    effect: defer
+    reason: shell commands require human approval
+    reason_code: SHELL_REQUIRES_APPROVAL
+  
+  - id: defer-financial
+    match:
+      tool: stripe/*
+    effect: defer
+    reason: financial operations require approval
+    reason_code: FINANCIAL_REQUIRES_APPROVAL
+  
+  # Everything else is denied by default_effect
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Writing Policies" icon="pen" href="/policy/writing-policies">
+    Learn best practices for writing policies
+  </Card>
+  <Card title="Policy Syntax" icon="code" href="/policy/policy-syntax">
+    Complete YAML schema reference
+  </Card>
+  <Card title="Validation" icon="shield-check" href="/policy/validation">
+    Validate policies in CI
+  </Card>
+  <Card title="Rule Evaluation" icon="list-check" href="/policy/rule-evaluation">
+    Understand first-match-wins semantics
+  </Card>
+</CardGroup>

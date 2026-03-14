@@ -1,0 +1,438 @@
+---
+title: "Multi-Agent Governance"
+description: "Session governance, cross-agent coordination, shared budgets, and loop detection for multi-agent systems"
+---
+
+Faramesh provides unified governance for multi-agent systems through session-scoped state management, budget coordination, loop detection, and cross-agent DPR linkage.
+
+---
+
+## Session Governance
+
+Session governance provides namespace isolation, write scanning, and schema validation for shared session state across agents.
+
+### Namespace Isolation
+
+Each agent gets an isolated namespace to prevent cross-agent interference:
+
+```go
+// internal/core/multiagent/sessiongov.go:25
+func NewStateNamespace(agentID string) StateNamespace {
+    return StateNamespace{
+        AgentID: agentID,
+        Prefix:  "agent:" + agentID + ":",
+    }
+}
+```
+
+**Key Features:**
+- Agent-scoped keys: `agent:{agentID}:{key}`
+- Shared namespace: `shared:{key}` for cross-agent data
+- Automatic namespacing on writes
+- Read-only access controls
+
+<Steps>
+  <Step title="Register Agent Namespace">
+    ```go
+    governor := multiagent.NewSessionGovernor()
+    governor.RegisterAgent("billing-agent")
+    governor.RegisterAgent("fraud-detector")
+    ```
+  </Step>
+
+  <Step title="Define Key Schemas">
+    ```go
+    governor.RegisterKeySchema(multiagent.KeySchema{
+        Key:       "shared:customer_context",
+        Type:      "object",
+        MaxLength: 10000,
+        SharedBy:  "billing-agent", // only this agent can write
+    })
+    ```
+  </Step>
+
+  <Step title="Validate Writes with Scanning">
+    ```go
+    canWrite, result := governor.CanWrite(
+        "billing-agent",
+        "shared:customer_context",
+        customerData,
+    )
+    if !canWrite {
+        fmt.Printf("Write blocked: %v\n", result.Violations)
+    }
+    ```
+  </Step>
+</Steps>
+
+### Write Scanning
+
+Every write to session state is scanned for injection, PII, and secrets:
+
+```yaml
+# Detected patterns (internal/core/multiagent/sessiongov.go:82)
+- Email addresses
+- SSN-like patterns (XXX-XX-XXXX)
+- Credit card numbers
+- IPv4 addresses
+- Secret patterns (password=, api_key=, token=)
+```
+
+**Write Scan Result:**
+
+```json
+{
+  "key": "shared:user_query",
+  "injection_risk": false,
+  "pii_detected": ["pattern_match"],
+  "secrets_found": false,
+  "violations": []
+}
+```
+
+<Warning>
+  Session state writes containing secrets are automatically blocked. Store credentials in a credential broker, not session state.
+</Warning>
+
+---
+
+## Cross-Agent Coordination
+
+### Agent Linkage Tracking
+
+When one agent invokes another, Faramesh creates bidirectional DPR linkage:
+
+```go
+// internal/core/multiagent/linkage.go:12
+type InvocationLink struct {
+    OuterAgentID string `json:"outer_agent_id"`
+    OuterDPRID   string `json:"outer_dpr_id"`
+    InnerAgentID string `json:"inner_agent_id"`
+    InnerDPRID   string `json:"inner_dpr_id"`
+    SessionID    string `json:"session_id"`
+}
+```
+
+**Track invocation chains:**
+
+```go
+linkage := multiagent.NewLinkageManager()
+linkage.RecordLink(multiagent.InvocationLink{
+    OuterAgentID: "orchestrator",
+    OuterDPRID:   "dpr_abc123",
+    InnerAgentID: "billing-agent",
+    InnerDPRID:   "dpr_xyz789",
+    SessionID:    "session_001",
+})
+
+// Query linkage
+chain := linkage.ChainFromDPR("dpr_abc123")
+for _, link := range chain {
+    fmt.Printf("%s → %s\n", link.OuterAgentID, link.InnerAgentID)
+}
+```
+
+### Sub-Agent Policies
+
+Orchestrators can attach invocation-scoped policies that **intersect** with the sub-agent's base policy:
+
+```go
+// internal/core/multiagent/subpolicy.go:13
+type SubPolicy struct {
+    InvocationID         string   `json:"invocation_id"`
+    AllowedTools         []string `json:"allowed_tools"`     // glob patterns
+    BlockedTools         []string `json:"blocked_tools"`     // additional blocks
+    MaxCostUSD           float64  `json:"max_cost_usd"`
+    MaxCalls             int      `json:"max_calls"`
+    AllowDeferEscalation bool     `json:"allow_defer_escalation"`
+}
+```
+
+**Example: Restrict sub-agent to read-only:**
+
+```go
+subPolicyMgr := multiagent.NewSubPolicyManager()
+subPolicyMgr.AttachPolicy(multiagent.SubPolicy{
+    InvocationID: "inv_001",
+    AllowedTools: []string{"db/read", "api/get"},  // only reads
+    BlockedTools: []string{"db/write", "db/delete"}, // block writes
+    MaxCostUSD:   5.0,
+    MaxCalls:     100,
+})
+
+allowed := subPolicyMgr.IsToolAllowed("inv_001", "db/write", true)
+// Returns: false (blocked by sub-policy even if base permits)
+```
+
+<Note>
+  **Most restrictive wins:** If base policy permits but sub-policy denies, the action is denied.
+</Note>
+
+---
+
+## Shared Budgets
+
+Shared budget management for fan-out multi-agent scenarios with aggregate and per-agent limits:
+
+```go
+// internal/core/multiagent/budget.go:28
+type BudgetManager struct {
+    sessionID      string
+    aggregateMax   float64
+    aggregateSpent float64
+    agents         map[string]*AgentBudget
+    onExceed       func(agentID string, spent, limit float64)
+}
+```
+
+<Steps>
+  <Step title="Create Budget Manager">
+    ```go
+    budgetMgr := multiagent.NewBudgetManager("session_001", 100.0) // $100 aggregate
+    budgetMgr.OnExceed(func(agentID string, spent, limit float64) {
+        log.Printf("Agent %s exceeded budget: spent $%.2f / $%.2f", 
+            agentID, spent, limit)
+    })
+    ```
+  </Step>
+
+  <Step title="Allocate Per-Agent Budgets">
+    ```go
+    // Allocate slices within the aggregate
+    budgetMgr.AllocateAgent("agent-1", 40.0)  // $40
+    budgetMgr.AllocateAgent("agent-2", 40.0)  // $40
+    budgetMgr.AllocateAgent("agent-3", 20.0)  // $20
+    // Total: $100 (exactly at aggregate limit)
+    ```
+  </Step>
+
+  <Step title="Record Cost and Check Limits">
+    ```go
+    shouldCancel, err := budgetMgr.RecordCost("agent-1", 15.50)
+    if shouldCancel {
+        // Cancel this agent's execution
+        log.Printf("Agent-1 cancelled due to budget exceedance")
+    }
+    ```
+  </Step>
+
+  <Step title="Monitor Budget Status">
+    ```go
+    status := budgetMgr.Status()
+    fmt.Printf("Aggregate: $%.2f / $%.2f\n", 
+        status.AggregateSpent, status.AggregateMax)
+    for _, agent := range status.Agents {
+        fmt.Printf("  %s: $%.2f / $%.2f (remaining: $%.2f)\n",
+            agent.AgentID, agent.SpentUSD, agent.MaxCostUSD, agent.Remaining())
+    }
+    ```
+  </Step>
+</Steps>
+
+**Aggregate Limit Behavior:**
+
+When aggregate limit is exceeded, **all remaining agents are cancelled**:
+
+```go
+// internal/core/multiagent/budget.go:104
+if bm.aggregateSpent > bm.aggregateMax {
+    shouldCancel = true
+    for _, a := range bm.agents {
+        if !a.Cancelled {
+            a.Cancelled = true
+            if bm.onExceed != nil {
+                bm.onExceed(a.AgentID, bm.aggregateSpent, bm.aggregateMax)
+            }
+        }
+    }
+}
+```
+
+---
+
+## Loop Detection
+
+Governs iterative refinement loops (generator + critic patterns) with convergence tracking:
+
+```go
+// internal/core/multiagent/loops.go:16
+type LoopConfig struct {
+    LoopID            string
+    MaxIterations     int
+    MaxTotalCostUSD   float64
+    MaxDuration       time.Duration
+    MinImprovementPct float64  // stop if improvement < this %
+    OnMaxReached      string   // "deny" or "defer"
+}
+```
+
+### Example: Generator-Critic Loop
+
+```go
+loopGov := multiagent.NewLoopGovernor()
+
+loopGov.StartLoop(multiagent.LoopConfig{
+    LoopID:            "summarization-loop",
+    MaxIterations:     10,
+    MaxTotalCostUSD:   2.50,
+    MaxDuration:       5 * time.Minute,
+    MinImprovementPct: 5.0,  // stop if improvement < 5%
+})
+
+for i := 0; i < 100; i++ {
+    // Generate candidate
+    candidate := generator.Generate()
+    score := critic.Score(candidate)
+    cost := 0.15  // cost of this iteration
+
+    canContinue, reason := loopGov.RecordIteration(
+        "summarization-loop",
+        "generator-agent",
+        score,
+        cost,
+    )
+
+    if !canContinue {
+        log.Printf("Loop stopped: %s", reason)
+        break
+    }
+}
+```
+
+**Stop Reasons:**
+
+```go
+// internal/core/multiagent/loops.go:107-125
+- "MAX_ITERATIONS_REACHED"      // hit iteration cap
+- "MAX_COST_REACHED"            // exceeded cost budget
+- "MAX_DURATION_REACHED"        // timed out
+- "CONVERGED: improvement 2.1% < minimum 5.0%"  // converged
+```
+
+### Convergence Analysis
+
+```go
+// Check if loop is converging
+isConverging := loopGov.IsConverging("summarization-loop", 5)
+
+// Get score trajectory
+trajectory := loopGov.ConvergenceTrajectory("summarization-loop")
+// Returns: [0.65, 0.72, 0.78, 0.81, 0.83, ...]
+```
+
+<Info>
+  Loop detection prevents runaway costs in iterative multi-agent patterns and automatically stops when improvement plateaus.
+</Info>
+
+---
+
+## Multi-Agent Policy Example
+
+```yaml
+faramesh-version: '1.0'
+agent-id: orchestrator
+default_effect: permit
+
+# Multi-agent configuration
+multi_agent:
+  max_concurrent_agents: 5
+  aggregate_budget_usd: 50.0
+  
+  # Session state governance
+  session_state:
+    schemas:
+      - key: shared:customer_context
+        type: object
+        max_length: 10000
+        shared_by: billing-agent
+      - key: shared:fraud_score
+        type: number
+        read_only: true
+        
+  # Sub-agent policy constraints
+  sub_agents:
+    - agent_id: billing-agent
+      allowed_tools: ["stripe/*", "db/read"]
+      max_cost_usd: 20.0
+      max_calls: 100
+      
+    - agent_id: fraud-detector
+      allowed_tools: ["risk/score", "db/read"]
+      max_cost_usd: 10.0
+      max_calls: 50
+      
+  # Loop governance
+  loops:
+    - loop_id: content-generation
+      max_iterations: 15
+      max_cost_usd: 5.0
+      max_duration: 10m
+      min_improvement_pct: 3.0
+      on_max_reached: defer
+
+rules:
+  - id: block-cross-agent-writes
+    match:
+      tool: session/write
+      when: '!namespace.IsOwned(args["key"])'
+    effect: deny
+    reason: agents cannot write to other agent namespaces
+    
+  - id: defer-high-value-multi-agent
+    match:
+      when: 'len(active_agents) > 3 && total_cost_usd > 30.0'
+    effect: defer
+    reason: high-value multi-agent session requires approval
+```
+
+---
+
+## CLI Commands
+
+```bash
+# View multi-agent session status
+faramesh session status <session-id>
+
+# Monitor shared budget
+faramesh budget status <session-id>
+
+# View agent linkage graph
+faramesh agent linkage <agent-id>
+
+# Inspect loop convergence
+faramesh loop status <loop-id>
+```
+
+---
+
+## Best Practices
+
+<Steps>
+  <Step title="Use Session Namespaces">
+    Always register agent namespaces to prevent state collision between agents.
+  </Step>
+
+  <Step title="Allocate Budgets Upfront">
+    Pre-allocate per-agent budgets before fan-out execution to ensure aggregate limits are respected.
+  </Step>
+
+  <Step title="Link DPR Records">
+    Always record invocation links to maintain full audit chain across agents.
+  </Step>
+
+  <Step title="Set Loop Limits">
+    Configure max iterations, cost, and convergence thresholds for all iterative patterns.
+  </Step>
+
+  <Step title="Use Sub-Policies">
+    Attach invocation-scoped policies when delegating to sub-agents to enforce least privilege.
+  </Step>
+</Steps>
+
+---
+
+## Related
+
+- [Observability](/advanced/observability) — Cross-session analytics and PIE
+- [Security](/advanced/security) — SPIFFE workload identity
+- [Policies](/policy/writing-policies) — Policy-as-code reference

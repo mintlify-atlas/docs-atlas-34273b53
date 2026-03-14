@@ -1,0 +1,645 @@
+---
+title: CLI Usage
+description: Complete reference for the faramesh command-line interface — from demo to production operations
+---
+
+The `faramesh` CLI is a single binary that handles everything from initial demos to production fleet management. This guide covers all commands and common workflows.
+
+## Installation
+
+<Tabs>
+  <Tab title="macOS / Linux (Homebrew)">
+    ```bash
+    brew install faramesh/tap/faramesh
+    ```
+  </Tab>
+  <Tab title="Install Script">
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/faramesh/faramesh-core/main/install.sh | sh
+    ```
+  </Tab>
+  <Tab title="Go Install">
+    ```bash
+    go install github.com/faramesh/faramesh-core/cmd/faramesh@latest
+    ```
+  </Tab>
+  <Tab title="Docker">
+    ```bash
+    docker pull ghcr.io/faramesh/faramesh:latest
+    docker run --rm ghcr.io/faramesh/faramesh:latest demo
+    ```
+  </Tab>
+</Tabs>
+
+## Quick Start Commands
+
+### `faramesh demo`
+
+Run a synthetic agent demo — the "hello world" of Faramesh.
+
+```bash
+faramesh demo
+```
+
+**Output:**
+
+```
+Faramesh — Unified Agent Governance
+Starting synthetic agent with demo policy...
+
+[10:00:15] PERMIT  get_exchange_rate      from=USD to=SEK              latency=11ms
+[10:00:17] DENY    shell/run              cmd="rm -rf /"               scanner=SCANNER_DENY  latency=0ms
+[10:00:18] PERMIT  read_customer          id=cust_abc123               latency=9ms
+[10:00:20] DEFER   stripe/refund          amount=$12,000               awaiting approval  policy=defer-high-value-refund
+[10:00:21] DENY    send_email             recipients=847               policy=deny-mass-email  latency=5ms
+
+─────────────────────────────────────────────
+5 actions evaluated. 2 PERMIT  2 DENY  1 DEFER
+```
+
+Zero config. Zero infrastructure. See governance in action in under 3 seconds.
+
+### `faramesh init`
+
+Auto-detect your environment and generate configuration.
+
+```bash
+faramesh init
+```
+
+**What it detects:**
+- Python, Node.js, Go environments
+- Kubernetes (kubectl, Helm)
+- Docker, Docker Compose
+- AWS Lambda
+- MCP servers
+
+**Generated files:**
+- `faramesh/policy.yaml` — Policy skeleton
+- Environment-specific config (Helm values, Docker Compose, etc.)
+
+**Example output:**
+
+```
+Faramesh 1.0.0 — Unified Governance Plane
+Detecting your environment...
+
+  ✓ Detected: Python 3.11.5 agent
+  ✓ Detected: Docker
+  ✗ Kubernetes cluster (optional)
+
+Recommended adapter: A1 (SDK Shim — zero infrastructure)
+Reason: No orchestration layer detected; SDK shim is the fastest path to governance
+
+Generating configuration...
+
+  faramesh/
+    policy.yaml         ← Policy file (edit this)
+
+Next steps:
+
+  1. Edit faramesh/policy.yaml — add your governance rules
+  2. faramesh policy validate faramesh/policy.yaml
+  3. from faramesh import govern
+     governed_tool = govern(my_tool, policy='faramesh/policy.yaml')
+  4. faramesh audit tail
+```
+
+## Policy Commands
+
+### `faramesh policy validate`
+
+Validate a policy file. Parses YAML, validates rule structure, and compiles all `when` conditions.
+
+```bash
+faramesh policy validate payment.yaml
+```
+
+**Success output:**
+
+```
+✓ payment.yaml  [sha256:a3f8c9...]  4 rules  agent=payment-bot
+```
+
+**Error output:**
+
+```
+✗ parse error: rule 'defer-high-value' missing required field 'match'
+```
+
+**Use in CI:**
+
+```yaml .github/workflows/validate-policy.yml
+name: Validate Policy
+on: [push, pull_request]
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Faramesh
+        run: curl -fsSL https://raw.githubusercontent.com/faramesh/faramesh-core/main/install.sh | sh
+      - name: Validate Policy
+        run: faramesh policy validate policies/payment.yaml
+```
+
+### `faramesh policy inspect`
+
+Show compiled policy summary.
+
+```bash
+faramesh policy inspect payment.yaml
+```
+
+**Output:**
+
+```
+Policy: payment.yaml
+  version    : sha256:a3f8c9d2...
+  agent-id   : payment-bot
+  fpl        : 1.0
+  rules      : 4
+  tools      : 0 declared
+  default    : permit
+
+Rules:
+  deny     deny-destructive-shell          tool=shell/run  when="args[\"cmd\"] matches \"rm\\\\s+-[rf]\""
+  defer    defer-high-value-refund         tool=stripe/refund  when="args[\"amount\"] > vars[\"max_refund\"]"
+  deny     deny-mass-email                 tool=send_email  when="len(args[\"recipients\"]) > 50"
+```
+
+### `faramesh policy test`
+
+Dry-run a governance decision without a running daemon.
+
+```bash
+faramesh policy test payment.yaml --tool stripe/refund --args '{"amount":10000}'
+```
+
+**Output:**
+
+```
+  Tool:    stripe/refund
+  Effect:  DEFER
+  Rule:    defer-high-value-refund
+  Reason:  refund exceeds threshold — requires finance approval
+  Code:    HIGH_VALUE_REFUND
+```
+
+**Test with JSON output:**
+
+```bash
+faramesh policy test payment.yaml --tool stripe/refund --args '{"amount":100}' --json
+```
+
+```json
+{
+  "effect": "PERMIT",
+  "rule_id": "",
+  "reason": "",
+  "reason_code": "",
+  "latency_ms": 0
+}
+```
+
+### `faramesh policy diff`
+
+Compare two policy versions.
+
+```bash
+faramesh policy diff policies/v1.yaml policies/v2.yaml
+```
+
+**Output:**
+
+```
+Policy diff
+  old: policies/v1.yaml  [sha256:a3f8...]  3 rules
+  new: policies/v2.yaml  [sha256:b7c2...]  4 rules
+
+  + defer-pii-access                  defer
+  ~ deny-mass-email                   deny → defer
+  - allow-dev-tools                   permit
+```
+
+## Daemon Commands
+
+### `faramesh serve`
+
+Start the Faramesh governance daemon.
+
+```bash
+faramesh serve --policy policy.yaml
+```
+
+**Options:**
+
+- `--policy` — Path to policy YAML file (default: `policy.yaml`)
+- `--data-dir` — Directory for WAL and DPR SQLite (default: `$TMPDIR/faramesh`)
+- `--socket` — Unix socket path (default: `/tmp/faramesh.sock`)
+- `--slack-webhook` — Slack webhook URL for DEFER notifications
+- `--log-level` — Log level: `debug`, `info`, `warn`, `error` (default: `info`)
+- `--sync-horizon` — Stream DPR records to Faramesh Horizon cloud (requires: `faramesh auth login`)
+
+**Example with all options:**
+
+```bash
+faramesh serve \
+  --policy /etc/faramesh/payment.yaml \
+  --data-dir /var/lib/faramesh \
+  --socket /var/run/faramesh.sock \
+  --slack-webhook https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXX \
+  --log-level debug \
+  --sync-horizon
+```
+
+**Run as systemd service:**
+
+```ini /etc/systemd/system/faramesh.service
+[Unit]
+Description=Faramesh Governance Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=faramesh
+Group=faramesh
+ExecStart=/usr/local/bin/faramesh serve --policy /etc/faramesh/policy.yaml --data-dir /var/lib/faramesh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable faramesh
+sudo systemctl start faramesh
+sudo systemctl status faramesh
+```
+
+## Audit Commands
+
+### `faramesh audit tail`
+
+Stream live governance decisions from a running daemon.
+
+```bash
+faramesh audit tail
+```
+
+**Output:**
+
+```
+Faramesh Audit Tail — streaming decisions (Ctrl+C to stop)
+
+[10:15:23] PERMIT  get_exchange_rate      payment-bot        rule=permit-safe-tools  8ms
+[10:15:25] DENY    stripe_refund          payment-bot        rule=deny-unauthorized  5ms
+[10:15:27] DEFER   stripe_refund          payment-bot        rule=defer-high-value   6ms
+```
+
+**Filter by agent:**
+
+```bash
+faramesh audit tail --agent payment-bot
+```
+
+**Custom socket path:**
+
+```bash
+faramesh audit tail --socket /var/run/faramesh.sock
+```
+
+### `faramesh audit verify`
+
+Verify the SHA256 chain integrity of a DPR SQLite store.
+
+```bash
+faramesh audit verify ~/.faramesh/faramesh.db
+```
+
+**Success output:**
+
+```
+Verifying DPR chain integrity: /home/user/.faramesh/faramesh.db
+Records to verify: 1247
+
+✓ Chain integrity verified. 1247 records, 0 violations.
+```
+
+**Violation detected:**
+
+```
+Verifying DPR chain integrity: /home/user/.faramesh/faramesh.db
+Records to verify: 1247
+
+✗ CHAIN VIOLATION record 543: rec_a3f8c9d2
+✗ 1 chain integrity violation(s) detected.
+```
+
+## Agent Commands
+
+### `faramesh agent approve`
+
+Approve a pending DEFER action.
+
+```bash
+faramesh agent approve abc12345
+```
+
+**Output:**
+
+```
+✓ DEFER token abc12345 approved
+```
+
+**Custom socket:**
+
+```bash
+faramesh agent approve abc12345 --socket /var/run/faramesh.sock
+```
+
+### `faramesh agent deny`
+
+Deny a pending DEFER action.
+
+```bash
+faramesh agent deny abc12345
+```
+
+**Output:**
+
+```
+✓ DEFER token abc12345 denied
+```
+
+### `faramesh agent kill`
+
+Activate kill switch for an agent — all subsequent calls will DENY.
+
+```bash
+faramesh agent kill payment-bot
+```
+
+**Output:**
+
+```
+⚡ Kill switch activated for agent: payment-bot
+All subsequent calls from this agent will be DENIED.
+```
+
+<Warning>
+The kill switch is immediate and affects all running sessions. Use with caution in production.
+</Warning>
+
+## Authentication Commands
+
+### `faramesh auth login`
+
+Authenticate with Faramesh Horizon (Cloud Platform).
+
+```bash
+faramesh auth login
+```
+
+**Interactive flow:**
+
+```
+Opening browser for authentication...
+✓ Authenticated as user@example.com
+✓ Organization: Acme Corp
+✓ Plan: Team
+```
+
+### `faramesh auth status`
+
+Show Horizon authentication status.
+
+```bash
+faramesh auth status
+```
+
+**Output:**
+
+```
+✓ Authenticated
+  Email: user@example.com
+  Org:   Acme Corp (org_1234567890)
+  Plan:  Team
+  Token: Valid until 2024-12-31
+```
+
+### `faramesh auth logout`
+
+Remove stored Horizon credentials.
+
+```bash
+faramesh auth logout
+```
+
+## Common Workflows
+
+### First-time Setup
+
+<Steps>
+
+<Step title="Run demo">
+```bash
+faramesh demo
+```
+</Step>
+
+<Step title="Initialize project">
+```bash
+faramesh init
+```
+</Step>
+
+<Step title="Edit policy">
+```bash
+vim faramesh/policy.yaml
+```
+</Step>
+
+<Step title="Validate policy">
+```bash
+faramesh policy validate faramesh/policy.yaml
+```
+</Step>
+
+<Step title="Start daemon">
+```bash
+faramesh serve --policy faramesh/policy.yaml
+```
+</Step>
+
+<Step title="Stream audit logs">
+```bash
+faramesh audit tail
+```
+</Step>
+
+</Steps>
+
+### Policy Development Workflow
+
+<Steps>
+
+<Step title="Test policy changes">
+```bash
+faramesh policy test payment.yaml --tool stripe/refund --args '{"amount":10000}'
+```
+</Step>
+
+<Step title="Validate policy">
+```bash
+faramesh policy validate payment.yaml
+```
+</Step>
+
+<Step title="Compare with production">
+```bash
+faramesh policy diff production/policy.yaml payment.yaml
+```
+</Step>
+
+<Step title="Deploy to daemon">
+```bash
+# Daemon auto-reloads on policy file change
+cp payment.yaml /etc/faramesh/policy.yaml
+```
+</Step>
+
+</Steps>
+
+### DEFER Approval Workflow
+
+<Steps>
+
+<Step title="Agent triggers DEFER">
+```python
+try:
+    governed_refund(amount=10000)
+except DeferredError as e:
+    print(f"Approve: faramesh agent approve {e.defer_token}")
+```
+</Step>
+
+<Step title="Stream audit logs to see DEFER">
+```bash
+faramesh audit tail
+```
+
+```
+[10:15:27] DEFER   stripe_refund          amount=$10,000   token=abc12345
+```
+</Step>
+
+<Step title="Approve or deny">
+```bash
+faramesh agent approve abc12345
+# or
+faramesh agent deny abc12345
+```
+</Step>
+
+<Step title="Agent unblocks">
+The SDK polls every 2 seconds. Once approved/denied, the governed function returns or raises `DeferredError`.
+</Step>
+
+</Steps>
+
+### Emergency Kill Switch
+
+<Steps>
+
+<Step title="Identify rogue agent">
+```bash
+faramesh audit tail
+```
+</Step>
+
+<Step title="Activate kill switch">
+```bash
+faramesh agent kill rogue-agent-id
+```
+</Step>
+
+<Step title="All calls DENIED">
+All subsequent tool calls from the agent are immediately denied with `reason_code: KILL_SWITCH_ACTIVE`.
+</Step>
+
+</Steps>
+
+## Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|--------|
+| `FARAMESH_SOCKET` | Unix socket path | `/tmp/faramesh.sock` |
+| `FARAMESH_POLICY` | Policy YAML path | `policy.yaml` |
+| `FARAMESH_AGENT_ID` | Default agent ID | `""` |
+| `FARAMESH_DATA_DIR` | Data directory for WAL/DPR | `$TMPDIR/faramesh` |
+
+## Exit Codes
+
+| Code | Meaning |
+|------|--------|
+| `0` | Success |
+| `1` | Error (parse error, validation error, daemon connection failed) |
+
+## Troubleshooting
+
+### Daemon won't start
+
+```
+Error: listen unix /tmp/faramesh.sock: bind: address already in use
+```
+
+**Solution:** Another daemon is running or stale socket exists.
+
+```bash
+rm /tmp/faramesh.sock
+faramesh serve --policy policy.yaml
+```
+
+### Policy validation fails
+
+```
+✗ parse error: rule 'defer-high-value' missing required field 'match'
+```
+
+**Solution:** Fix the policy YAML. Every rule must have:
+- `id`
+- `match` (with `tool` or `when`)
+- `effect`
+
+### Audit tail can't connect
+
+```
+Error: connect to daemon at /tmp/faramesh.sock: connection refused
+
+Is the daemon running? Try: faramesh serve --policy policy.yaml
+```
+
+**Solution:** Start the daemon first.
+
+```bash
+faramesh serve --policy policy.yaml
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Daemon Mode" icon="server" href="/guides/daemon-mode">
+    Run the daemon as a persistent service
+  </Card>
+  <Card title="Policy Language" icon="file-code" href="/policy/writing-policies">
+    Write expressive policy rules
+  </Card>
+  <Card title="Python SDK" icon="python" href="/guides/python-sdk">
+    Integrate with Python agents
+  </Card>
+  <Card title="DEFER Workflow" icon="clock" href="/concepts/defer-workflow">
+    Human-in-the-loop approvals
+  </Card>
+</CardGroup>

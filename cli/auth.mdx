@@ -1,0 +1,268 @@
+---
+title: "faramesh auth"
+description: "Authenticate with Faramesh Horizon cloud"
+---
+
+## Overview
+
+The `faramesh auth` command group manages authentication with Faramesh Horizon, the cloud platform for fleet management, compliance exports, and DPR sync.
+
+## Commands
+
+### `faramesh auth login`
+
+Authenticate with Faramesh Horizon.
+
+```bash
+faramesh auth login
+```
+
+**What it does:**
+- Prompts for a Horizon API token (or accepts via `--token` flag)
+- Validates the token against the Horizon API
+- Saves the token to `~/.faramesh/horizon.json`
+- Displays organization and user information
+
+**Example:**
+```bash
+$ faramesh auth login
+
+Faramesh Horizon Login
+
+Get your API token from:
+  https://app.faramesh.io/settings/tokens
+
+Enter your API token: frm_1a2b3c4d5e6f...
+Authenticating with Horizon...
+
+✓ Authenticated with Faramesh Horizon
+
+  User:    alice@example.com
+  Org:     Acme Corp (org_abc123)
+  Horizon: https://api.faramesh.io
+
+To sync DPR records to Horizon, run:
+  faramesh serve --policy policy.yaml --sync-horizon
+```
+
+**Flags:**
+
+<ParamField path="--token" type="string">
+  API token from https://app.faramesh.io/settings/tokens. If not provided, prompts interactively.
+</ParamField>
+
+<ParamField path="--horizon-url" type="string" default="https://api.faramesh.io">
+  Horizon API URL. Use this for self-hosted Horizon instances.
+</ParamField>
+
+**Non-interactive login:**
+```bash
+faramesh auth login --token frm_1a2b3c4d5e6f...
+```
+
+**Self-hosted Horizon:**
+```bash
+faramesh auth login --horizon-url https://horizon.company.com
+```
+
+---
+
+### `faramesh auth logout`
+
+Remove stored Horizon credentials.
+
+```bash
+faramesh auth logout
+```
+
+**What it does:**
+- Deletes `~/.faramesh/horizon.json`
+- Revokes the stored token (if Horizon API is reachable)
+
+**Example:**
+```bash
+$ faramesh auth logout
+✓ Logged out of Faramesh Horizon
+```
+
+---
+
+### `faramesh auth status`
+
+Show current Horizon authentication status.
+
+```bash
+faramesh auth status
+```
+
+Aliases: `whoami`
+
+**Example output (authenticated):**
+```bash
+$ faramesh auth status
+
+✓ Authenticated with Faramesh Horizon
+
+  User:       alice@example.com
+  Org:        Acme Corp (org_abc123)
+  Horizon:    https://api.faramesh.io
+  Token:      frm_1a2b...
+  Saved at:   15 Jan 24 10:30 PST
+  Expires:    never
+```
+
+**Example output (not authenticated):**
+```bash
+$ faramesh auth status
+
+Not authenticated with Faramesh Horizon
+
+Run: faramesh auth login
+```
+
+**Example output (expired):**
+```bash
+$ faramesh auth status
+
+Token expired — please re-authenticate
+
+Run: faramesh auth login
+```
+
+---
+
+## Horizon Sync
+
+After authenticating, enable DPR sync to Horizon:
+
+```bash
+faramesh serve --policy policy.yaml --sync-horizon
+```
+
+This enables:
+
+<CardGroup cols={2}>
+  <Card title="Fleet management" icon="network-wired">
+    Manage multiple agents from the Horizon web dashboard.
+  </Card>
+  <Card title="Compliance exports" icon="file-contract">
+    Generate SOC 2, HIPAA, PCI-DSS compliance reports.
+  </Card>
+  <Card title="Observability" icon="chart-line">
+    Real-time dashboards for agent behavior, PERMIT/DENY ratios, and anomaly detection.
+  </Card>
+  <Card title="Policy drift detection" icon="code-compare">
+    Detect when agent behavior diverges from expected patterns.
+  </Card>
+</CardGroup>
+
+**How sync works:**
+
+1. Daemon writes decision to local WAL (fsync)
+2. Decision is returned to agent
+3. **Asynchronously**, the decision is:
+   - Replicated to local SQLite DPR store
+   - Streamed to Horizon API (if `--sync-horizon` enabled)
+
+If Horizon API is unreachable, decisions are queued and retried (exponential backoff, max 5 minutes).
+
+<Note>
+  DPR sync is **asynchronous**. Local governance decisions are never blocked by Horizon API latency or availability.
+</Note>
+
+---
+
+## Token Storage
+
+Horizon tokens are stored in:
+
+```
+~/.faramesh/horizon.json
+```
+
+Example:
+
+```json
+{
+  "token": "frm_1a2b3c4d5e6f...",
+  "org_id": "org_abc123",
+  "org_name": "Acme Corp",
+  "user_email": "alice@example.com",
+  "horizon_url": "https://api.faramesh.io",
+  "created_at": "2024-01-15T10:30:00Z",
+  "expires_at": "0001-01-01T00:00:00Z"
+}
+```
+
+**Security:**
+
+- File permissions: `0600` (owner read/write only)
+- Never commit this file to version control
+- Token is validated against Horizon `/v1/auth/me` endpoint on login
+
+---
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Invalid token error">
+    The token you entered is invalid or expired. Generate a new token:
+    
+    1. Go to https://app.faramesh.io/settings/tokens
+    2. Click "Create Token"
+    3. Copy the token
+    4. Run: `faramesh auth login --token <token>`
+  </Accordion>
+
+  <Accordion title="Could not reach Horizon API">
+    The Horizon API is unreachable (network issue, self-hosted instance down, etc.).
+    
+    The token is still saved locally. Governance continues to work without Horizon sync.
+    
+    Check:
+    - Network connectivity: `curl https://api.faramesh.io/health`
+    - Horizon URL: `faramesh auth status`
+    - Self-hosted instance: `curl https://horizon.company.com/health`
+  </Accordion>
+
+  <Accordion title="Permission denied writing to ~/.faramesh/">
+    Ensure the directory is writable:
+    ```bash
+    mkdir -p ~/.faramesh
+    chmod 700 ~/.faramesh
+    ```
+  </Accordion>
+
+  <Accordion title="faramesh serve fails with 'not authenticated'">
+    You must run `faramesh auth login` before using `--sync-horizon`:
+    ```bash
+    faramesh auth login
+    faramesh serve --policy policy.yaml --sync-horizon
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Self-Hosted Horizon
+
+For self-hosted Horizon instances:
+
+```bash
+faramesh auth login --horizon-url https://horizon.company.com
+```
+
+The daemon will sync to your self-hosted instance:
+
+```bash
+faramesh serve --policy policy.yaml --sync-horizon
+```
+
+The Horizon URL is stored in `~/.faramesh/horizon.json` and automatically used for all subsequent operations.
+
+---
+
+## Related Commands
+
+- [`faramesh serve`](/cli/serve) — Start the daemon with Horizon sync
+- [`faramesh audit export`](/cli/audit) — Export DPR records locally (alternative to Horizon)

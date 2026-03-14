@@ -1,0 +1,328 @@
+---
+title: FarameshClient
+description: Low-level JSON-over-Unix-socket client for the Faramesh daemon
+---
+
+The `FarameshClient` class provides a thread-safe, low-level client for communicating with the Faramesh governance daemon via Unix domain sockets.
+
+<Note>
+  Most users should use the `govern()` decorator instead of interacting with `FarameshClient` directly.
+</Note>
+
+## Class Definition
+
+```python
+class FarameshClient:
+    def __init__(self, socket_path: str = "/tmp/faramesh.sock")
+```
+
+## Constructor
+
+<ParamField path="socket_path" type="str" default="/tmp/faramesh.sock">
+  Path to the Unix domain socket where the Faramesh daemon is listening.
+</ParamField>
+
+## Methods
+
+### govern()
+
+Submit a tool call for governance.
+
+```python
+def govern(
+    self,
+    agent_id: str,
+    session_id: str,
+    tool_id: str,
+    args: dict[str, Any],
+) -> dict[str, Any]
+```
+
+#### Parameters
+
+<ParamField path="agent_id" type="str" required>
+  The agent identity making the tool call.
+</ParamField>
+
+<ParamField path="session_id" type="str" required>
+  The session identifier for grouping related calls.
+</ParamField>
+
+<ParamField path="tool_id" type="str" required>
+  The tool identifier referenced in the policy.
+</ParamField>
+
+<ParamField path="args" type="dict[str, Any]" required>
+  The tool call arguments as a JSON-serializable dictionary.
+</ParamField>
+
+#### Returns
+
+<ResponseField name="decision" type="dict[str, Any]">
+  A governance decision with the following keys:
+  
+  <ResponseField name="effect" type="str">
+    One of: `"PERMIT"`, `"DENY"`, `"DEFER"`, or `"SHADOW"`
+  </ResponseField>
+  
+  <ResponseField name="rule_id" type="str">
+    The ID of the matching policy rule
+  </ResponseField>
+  
+  <ResponseField name="reason" type="str">
+    Human-readable explanation for the decision
+  </ResponseField>
+  
+  <ResponseField name="reason_code" type="str">
+    Machine-readable reason code
+  </ResponseField>
+  
+  <ResponseField name="defer_token" type="str">
+    Set when `effect == "DEFER"`. Use this token to poll or approve the action.
+  </ResponseField>
+  
+  <ResponseField name="latency_ms" type="int">
+    Policy evaluation latency in milliseconds
+  </ResponseField>
+</ResponseField>
+
+### poll_defer()
+
+Poll the status of a pending DEFER.
+
+```python
+def poll_defer(self, agent_id: str, defer_token: str) -> str
+```
+
+#### Parameters
+
+<ParamField path="agent_id" type="str" required>
+  The agent identity that initiated the deferred call.
+</ParamField>
+
+<ParamField path="defer_token" type="str" required>
+  The defer token returned from the original `govern()` call.
+</ParamField>
+
+#### Returns
+
+<ResponseField name="status" type="str">
+  One of:
+  - `"pending"` — awaiting human approval
+  - `"approved"` — approved for execution
+  - `"denied"` — explicitly denied
+  - `"expired"` — approval window expired
+  - `"resolved"` — final state reached
+</ResponseField>
+
+### wait_for_defer()
+
+Block until a DEFER is resolved, denied, or expired.
+
+```python
+def wait_for_defer(
+    self,
+    agent_id: str,
+    defer_token: str,
+    timeout: float = 300.0,
+) -> str
+```
+
+#### Parameters
+
+<ParamField path="agent_id" type="str" required>
+  The agent identity that initiated the deferred call.
+</ParamField>
+
+<ParamField path="defer_token" type="str" required>
+  The defer token returned from the original `govern()` call.
+</ParamField>
+
+<ParamField path="timeout" type="float" default="300.0">
+  Maximum time to wait in seconds (default: 5 minutes).
+</ParamField>
+
+#### Returns
+
+<ResponseField name="status" type="str">
+  The final status: `"approved"`, `"denied"`, or `"expired"`
+</ResponseField>
+
+## Protocol
+
+The client communicates using newline-delimited JSON over a Unix domain socket:
+
+1. Each message is a JSON object followed by `\n`
+2. The daemon responds with a JSON object followed by `\n`
+3. Connections are short-lived (one request-response per connection)
+
+<CodeGroup>
+
+```python Request
+{
+  "type": "govern",
+  "call_id": "550e8400-e29b-41d4-a716-446655440000",
+  "agent_id": "payment-bot",
+  "session_id": "sess_abc123",
+  "tool_id": "stripe_refund",
+  "args": {"amount": 100, "currency": "usd"}
+}
+```
+
+```python Response
+{
+  "effect": "PERMIT",
+  "rule_id": "allow_small_refunds",
+  "reason": "amount < 1000",
+  "reason_code": "PERMIT",
+  "latency_ms": 5
+}
+```
+
+</CodeGroup>
+
+## Binary Auto-Start
+
+The daemon binary is managed automatically via `_binary.py`:
+
+1. **Download on first use**: The correct platform binary is downloaded from GitHub Releases
+2. **Cached locally**: Stored in `~/.faramesh/bin/faramesh-{version}-{platform}`
+3. **Auto-started**: When `auto_start=True` in `govern()`, the daemon is launched as a subprocess
+4. **No Go toolchain required**: Users only need `pip install faramesh`
+
+### Supported Platforms
+
+- Linux (amd64, arm64)
+- macOS (amd64, arm64)
+- Windows (amd64)
+
+### Manual Binary Installation
+
+If auto-download fails, install manually:
+
+```bash
+curl -fsSL https://faramesh.dev/install.sh | sh
+```
+
+Or set a custom binary location:
+
+```bash
+export FARAMESH_CACHE_DIR=/opt/faramesh/bin
+```
+
+## Exception Handling
+
+The client raises `DaemonError` for connection issues:
+
+```python
+from faramesh.client import FarameshClient
+from faramesh.exceptions import DaemonError
+
+client = FarameshClient()
+
+try:
+    decision = client.govern(
+        agent_id="bot",
+        session_id="sess_123",
+        tool_id="dangerous_action",
+        args={"target": "production"},
+    )
+except DaemonError as e:
+    print(f"Daemon error: {e}")
+    # Possible causes:
+    # - Socket not found: daemon not running
+    # - Connection refused: daemon crashed
+    # - Timeout: daemon overloaded
+```
+
+## Thread Safety
+
+The `FarameshClient` is thread-safe:
+
+- Internal `_lock` ensures safe concurrent access
+- Each `govern()` call opens a new socket connection
+- No shared mutable state across requests
+
+```python
+import threading
+from faramesh.client import FarameshClient
+
+client = FarameshClient()
+
+def worker(tool_id: str):
+    decision = client.govern(
+        agent_id="multi-agent",
+        session_id="shared-session",
+        tool_id=tool_id,
+        args={},
+    )
+    print(f"{tool_id}: {decision['effect']}")
+
+threads = [
+    threading.Thread(target=worker, args=(f"tool_{i}",))
+    for i in range(10)
+]
+
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+```
+
+## Advanced Usage
+
+### Custom Timeout
+
+```python
+from faramesh.client import FarameshClient
+
+client = FarameshClient()
+
+# Wait up to 60 seconds for approval
+status = client.wait_for_defer(
+    agent_id="critical-agent",
+    defer_token="defer_abc123",
+    timeout=60.0,
+)
+
+if status == "approved":
+    # Execute the action
+    pass
+elif status == "expired":
+    # Log timeout
+    pass
+```
+
+### Manual Polling
+
+```python
+import time
+from faramesh.client import FarameshClient
+
+client = FarameshClient()
+
+# Initial governance decision
+decision = client.govern(
+    agent_id="agent-1",
+    session_id="sess_xyz",
+    tool_id="risky_operation",
+    args={},
+)
+
+if decision["effect"] == "DEFER":
+    defer_token = decision["defer_token"]
+    
+    # Poll every 5 seconds
+    while True:
+        status = client.poll_defer(
+            agent_id="agent-1",
+            defer_token=defer_token,
+        )
+        
+        if status != "pending":
+            print(f"Final status: {status}")
+            break
+        
+        print("Still waiting for approval...")
+        time.sleep(5)
+```

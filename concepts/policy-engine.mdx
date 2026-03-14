@@ -1,0 +1,444 @@
+---
+title: 'Policy Engine'
+description: 'Policy-as-code with YAML + expr-lang evaluation'
+---
+
+## Overview
+
+Faramesh policies are written in YAML with conditions in [expr-lang](https://github.com/expr-lang/expr) — a Go-native, type-safe, sandboxed expression language. Policies compile to bytecode at load time and evaluate at **~1 microsecond per rule**.
+
+<Info>
+Policies are evaluated in a **first-match-wins** order. The first rule whose `match` conditions are satisfied determines the decision (PERMIT, DENY, DEFER, or SHADOW).
+</Info>
+
+## Policy Structure
+
+A Faramesh policy file has this structure:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: payment-bot
+default_effect: permit  # Applied when no rule matches
+
+vars:
+  max_refund: 500
+  max_email_recipients: 50
+
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    tags: [financial]
+    cost_usd: 0.10
+
+rules:
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]"'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold — requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+```
+
+## Top-Level Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `faramesh-version` | string | Policy language version (currently `'1.0'`) |
+| `agent-id` | string | Default agent ID for this policy |
+| `default_effect` | string | Effect when no rule matches: `permit` or `deny` |
+| `vars` | map | Variables accessible in rule conditions as `vars["key"]` |
+| `tools` | map | Tool metadata (reversibility, cost, tags) |
+| `rules` | array | Governance rules evaluated in order |
+| `budget` | object | Optional: session/daily cost limits |
+
+See [schema.go:13-66](https://github.com/faramesh/faramesh-core/blob/main/internal/core/policy/schema.go:13) for the complete schema.
+
+## Rule Structure
+
+Each rule has these fields:
+
+<Steps>
+  <Step title="id (required)">
+    Unique identifier for this rule. Appears in audit logs and DPR records.
+    ```yaml
+    id: deny-destructive-shell
+    ```
+  </Step>
+  
+  <Step title="match (required)">
+    Conditions that must be satisfied for this rule to fire.
+    ```yaml
+    match:
+      tool: shell/run              # Glob pattern: "stripe/*", "*", "shell/run"
+      when: 'args["cmd"] matches "rm\\s+-[rf]"'  # expr-lang expression
+    ```
+  </Step>
+  
+  <Step title="effect (required)">
+    What happens when the rule matches: `permit`, `deny`, `defer`, or `shadow`.
+    ```yaml
+    effect: deny
+    ```
+  </Step>
+  
+  <Step title="reason (optional but recommended)">
+    Human-readable explanation shown to the agent.
+    ```yaml
+    reason: destructive shell command blocked by policy
+    ```
+  </Step>
+  
+  <Step title="reason_code (optional)">
+    Machine-readable code for programmatic handling.
+    ```yaml
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+    ```
+  </Step>
+</Steps>
+
+## Effects
+
+Faramesh supports four decision effects:
+
+### PERMIT
+
+Allow the tool call to execute.
+
+```yaml
+- id: permit-normal-refund
+  match:
+    tool: stripe/refund
+    when: 'args["amount"] <= vars["max_refund"]'
+  effect: permit
+  reason: refund within authorized threshold
+```
+
+### DENY
+
+Block the tool call immediately. Return an error to the agent.
+
+```yaml
+- id: deny-destructive-shell
+  match:
+    tool: shell/run
+    when: 'args["cmd"] matches "rm\\s+-[rf]"'
+  effect: deny
+  reason: destructive shell command blocked by policy
+  reason_code: DESTRUCTIVE_SHELL_COMMAND
+```
+
+### DEFER
+
+Pause execution and wait for human approval (human-in-the-loop).
+
+```yaml
+- id: defer-high-value-refund
+  match:
+    tool: stripe/refund
+    when: 'args["amount"] > vars["max_refund"]'
+  effect: defer
+  reason: refund exceeds threshold — requires finance approval
+  reason_code: HIGH_VALUE_REFUND
+```
+
+See [DEFER Workflow](/concepts/defer-workflow) for details.
+
+### SHADOW
+
+Log what would have happened without blocking. Useful for testing new policies.
+
+```yaml
+- id: shadow-mass-email
+  match:
+    tool: send_email
+    when: 'len(args["recipients"]) > 50'
+  effect: shadow
+  reason: would deny mass email in enforcement mode
+```
+
+## Expr-Lang Conditions
+
+The `when` field uses [expr-lang](https://github.com/expr-lang/expr) — a safe, fast expression language compiled to bytecode.
+
+### Available Variables
+
+<Accordion title="args — Tool Arguments">
+  Access tool call arguments:
+  ```yaml
+  when: 'args["amount"] > 1000'
+  when: 'args["cmd"] matches "rm"'
+  when: 'len(args["recipients"]) > 50'
+  ```
+</Accordion>
+
+<Accordion title="vars — Policy Variables">
+  Reference policy-level variables:
+  ```yaml
+  vars:
+    max_refund: 500
+  
+  rules:
+    - when: 'args["amount"] > vars["max_refund"]'
+  ```
+</Accordion>
+
+<Accordion title="session — Session Context">
+  Access session-level state:
+  ```yaml
+  when: 'session.call_count > 100'
+  when: 'session.cost_usd > 10.0'
+  when: 'len(session.history) > 0'
+  ```
+  
+  Available fields:
+  - `session.call_count` — Total calls in this session
+  - `session.cost_usd` — Session cost in USD
+  - `session.daily_cost_usd` — Daily cost in USD
+  - `session.history` — Array of recent tool calls
+</Accordion>
+
+<Accordion title="tool — Tool Metadata">
+  Access tool metadata from the `tools:` block:
+  ```yaml
+  when: 'tool.blast_radius == "external"'
+  when: 'contains(tool.tags, "financial")'
+  ```
+  
+  Available fields:
+  - `tool.reversibility` — "irreversible" | "reversible" | "compensatable"
+  - `tool.blast_radius` — "none" | "local" | "scoped" | "external"
+  - `tool.tags` — Array of string tags
+</Accordion>
+
+<Accordion title="principal — Identity Context (Optional)">
+  Reference the invoking principal:
+  ```yaml
+  when: 'principal.tier == "free"'
+  when: 'principal.role != "admin"'
+  when: 'principal.verified == false'
+  ```
+</Accordion>
+
+<Accordion title="time — Temporal Context">
+  Time-based conditions:
+  ```yaml
+  when: 'time.hour >= 22 || time.hour <= 6'  # After 10 PM or before 6 AM
+  when: 'time.weekday == 6 || time.weekday == 7'  # Weekend
+  ```
+</Accordion>
+
+### Built-in Functions
+
+<CardGroup cols={2}>
+  <Card title="matches" icon="magnifying-glass">
+    Regex pattern matching:
+    ```yaml
+    when: 'args["cmd"] matches "rm\\s+-[rf]"'
+    ```
+  </Card>
+  
+  <Card title="len" icon="list">
+    Get array/string length:
+    ```yaml
+    when: 'len(args["recipients"]) > 50'
+    ```
+  </Card>
+  
+  <Card title="contains" icon="check">
+    Check if array contains value:
+    ```yaml
+    when: 'contains(tool.tags, "financial")'
+    ```
+  </Card>
+  
+  <Card title="history_contains_within" icon="clock">
+    Check if tool was called recently:
+    ```yaml
+    when: 'history_contains_within("http/post", 120)'
+    ```
+    Returns true if any call matching the pattern occurred within N seconds.
+  </Card>
+</CardGroup>
+
+## Tool Metadata
+
+Define tool metadata in the `tools:` block:
+
+```yaml
+tools:
+  stripe/refund:
+    reversibility: compensatable  # Can be reversed via compensation
+    blast_radius: external        # Affects external systems
+    shadow_safe: false            # Cannot run in shadow mode
+    tags: [financial, pii_sink]
+    cost_usd: 0.10               # Estimated cost per call
+```
+
+This metadata is accessible in rule conditions via `tool.reversibility`, `tool.blast_radius`, etc.
+
+## Policy Validation
+
+Validate policies in CI/CD:
+
+```bash
+faramesh policy validate policies/payment.yaml
+```
+
+This:
+- Parses YAML structure
+- Validates rule IDs are unique
+- Compiles all `when` expressions to bytecode
+- Checks for common errors (invalid effects, malformed patterns)
+- Exits 0 on success, 1 on error
+
+<Note>
+Integrate `faramesh policy validate` into your CI pipeline to catch policy errors before deployment.
+</Note>
+
+## First-Match-Wins Evaluation
+
+Rules are evaluated **in document order**. The first rule whose `tool` pattern and `when` condition both match determines the decision.
+
+```yaml
+rules:
+  # Rule 1: Checked first
+  - id: deny-high-value
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 10000'
+    effect: deny
+
+  # Rule 2: Only checked if Rule 1 doesn't match
+  - id: defer-medium-value
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 500'
+    effect: defer
+
+  # Rule 3: Only checked if Rules 1 and 2 don't match
+  - id: permit-low-value
+    match:
+      tool: stripe/refund
+    effect: permit
+```
+
+<Warning>
+**Order matters!** Place more specific rules before general ones. A catch-all rule like `tool: "*"` will prevent all subsequent rules from ever matching.
+</Warning>
+
+## Performance
+
+Policy evaluation is **fast**:
+
+- Conditions compile to bytecode at policy load time
+- Evaluation runs at **~1 microsecond per rule**
+- No network calls (unless using external selectors)
+- First-match-wins means only necessary rules are evaluated
+
+From [engine.go:126-175](https://github.com/faramesh/faramesh-core/blob/main/internal/core/policy/engine.go:126):
+
+```go
+// Evaluate runs the first-match-wins evaluation pipeline.
+// If no rule matches, the policy's default_effect is applied.
+func (e *Engine) Evaluate(toolID string, ctx EvalContext) EvalResult {
+    for i, rule := range e.doc.Rules {
+        if !matchTool(rule.Match.Tool, toolID) {
+            continue  // Skip rules that don't match tool pattern
+        }
+        if e.programs[i] != nil {
+            out, err := vm.Run(e.programs[i], env)  // ~1μs
+            // ...
+        }
+        return EvalResult{Effect: rule.Effect, RuleID: rule.ID}
+    }
+    // No match → apply default_effect
+}
+```
+
+## Example: Full Policy
+
+Here's the complete demo policy from [demo.yaml](https://github.com/faramesh/faramesh-core/blob/main/policies/demo.yaml):
+
+```yaml
+faramesh-version: '1.0'
+agent-id: demo-agent
+default_effect: permit
+
+vars:
+  max_refund: 500
+  max_email_recipients: 50
+
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    tags: [financial]
+  shell/run:
+    reversibility: irreversible
+    blast_radius: local
+    tags: [system]
+  send_email:
+    reversibility: irreversible
+    blast_radius: external
+    tags: [communication]
+
+rules:
+  # Deny destructive shell commands before they run.
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs"'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+    incident_category: destructive_command
+    incident_severity: critical
+
+  # Require human approval for high-value refunds.
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold and requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+
+  # Deny mass email operations.
+  - id: deny-mass-email
+    match:
+      tool: send_email
+      when: 'len(args["recipients"]) > vars["max_email_recipients"]'
+    effect: deny
+    reason: mass email to more than 50 recipients requires manual review
+    reason_code: MASS_EMAIL_LIMIT
+
+  # Permit normal refunds under the threshold.
+  - id: permit-normal-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] <= vars["max_refund"]'
+    effect: permit
+    reason: refund within authorized threshold
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="DPR Chain" icon="link" href="/concepts/dpr-chain">
+    Learn how every decision is recorded in a tamper-evident audit chain.
+  </Card>
+  
+  <Card title="DEFER Workflow" icon="hand" href="/concepts/defer-workflow">
+    Understand human-in-the-loop approval for high-stakes actions.
+  </Card>
+</CardGroup>

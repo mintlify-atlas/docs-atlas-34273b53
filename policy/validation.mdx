@@ -1,0 +1,469 @@
+---
+title: Policy Validation
+description: Validate Faramesh policies in CI and catch errors before deployment
+---
+
+Faramesh provides built-in policy validation to catch errors before deployment. The `faramesh policy validate` command parses policy files, validates rule structure, and compiles all `when` conditions with expr-lang.
+
+## Basic Validation
+
+Validate a single policy file:
+
+```bash
+faramesh policy validate policies/demo.yaml
+```
+
+**Success output:**
+```
+✓ policies/demo.yaml  [2f8a9c1b]  4 rules  agent=demo-agent
+```
+
+**Error output:**
+```
+✗ parse error: yaml: line 12: found unexpected end of document
+```
+
+The command exits with status code:
+- **0** on success (valid policy)
+- **1** on error (invalid policy)
+
+This makes it perfect for CI integration.
+
+## Validation Checks
+
+The validator performs these checks:
+
+<Steps>
+  <Step title="YAML Syntax">
+    Ensures the file is valid YAML.
+  </Step>
+  
+  <Step title="Schema Validation">
+    Verifies required fields (`faramesh-version`, `agent-id`, `rules`) are present.
+  </Step>
+  
+  <Step title="Rule Structure">
+    Checks that each rule has `id`, `match`, `effect`, and `reason`.
+  </Step>
+  
+  <Step title="Effect Values">
+    Validates `effect` is one of: `permit`, `deny`, `defer`, `allow`, `halt`, `abstain`.
+  </Step>
+  
+  <Step title="Expression Compilation">
+    Compiles all `when` conditions with expr-lang to catch syntax errors.
+  </Step>
+  
+  <Step title="Tool Pattern Syntax">
+    Validates `match.tool` patterns are valid glob patterns.
+  </Step>
+  
+  <Step title="Duplicate Rule IDs">
+    Ensures all rule IDs are unique within the policy.
+  </Step>
+</Steps>
+
+## CI Integration
+
+Add validation to your CI pipeline to catch policy errors before deployment.
+
+### GitHub Actions
+
+```yaml
+name: Validate Policies
+
+on:
+  pull_request:
+    paths:
+      - 'policies/**/*.yaml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Faramesh
+        run: |
+          curl -fsSL https://get.faramesh.dev | sh
+      
+      - name: Validate all policies
+        run: |
+          for policy in policies/*.yaml; do
+            faramesh policy validate "$policy"
+          done
+```
+
+### GitLab CI
+
+```yaml
+validate-policies:
+  stage: test
+  image: faramesh/faramesh:latest
+  script:
+    - for policy in policies/*.yaml; do faramesh policy validate "$policy"; done
+  only:
+    changes:
+      - policies/**/*.yaml
+```
+
+### Pre-commit Hook
+
+Add a pre-commit hook to validate policies locally:
+
+```bash
+#!/bin/bash
+# .git/hooks/pre-commit
+
+for policy in $(git diff --cached --name-only | grep 'policies/.*\.yaml$'); do
+  if ! faramesh policy validate "$policy"; then
+    echo "❌ Policy validation failed: $policy"
+    exit 1
+  fi
+done
+```
+
+Make it executable:
+
+```bash
+chmod +x .git/hooks/pre-commit
+```
+
+## Common Validation Errors
+
+### Missing Required Fields
+
+**Error:**
+```
+✗ missing required field: agent-id
+```
+
+**Fix:** Add the missing field to your policy:
+
+```yaml
+faramesh-version: "1.0"
+agent-id: "my-agent"  # Add this
+rules:
+  # ...
+```
+
+### Invalid Effect Value
+
+**Error:**
+```
+✗ rule "my-rule": invalid effect "block" (must be permit, deny, or defer)
+```
+
+**Fix:** Use a valid effect value:
+
+```yaml
+rules:
+  - id: my-rule
+    match:
+      tool: "*"
+    effect: deny  # Was: block
+```
+
+### Expression Compilation Error
+
+**Error:**
+```
+✗ rule "check-amount": compilation error: undefined variable "ammount" (1:6)
+ | args["ammount"] > 500
+ | .....^
+```
+
+**Fix:** Correct the typo in the `when` condition:
+
+```yaml
+rules:
+  - id: check-amount
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 500'  # Fixed typo
+```
+
+### Duplicate Rule ID
+
+**Error:**
+```
+✗ duplicate rule ID: "defer-refund"
+```
+
+**Fix:** Ensure all rule IDs are unique:
+
+```yaml
+rules:
+  - id: defer-high-value-refund  # Make IDs unique
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 500'
+    effect: defer
+  
+  - id: defer-weekend-refund  # Was: defer-refund
+    match:
+      tool: stripe/refund
+      when: 'time.weekday > 5'
+    effect: defer
+```
+
+### Invalid YAML Syntax
+
+**Error:**
+```
+✗ parse error: yaml: line 12: mapping values are not allowed in this context
+```
+
+**Fix:** Check for indentation errors, missing colons, or incorrect YAML structure.
+
+Common YAML mistakes:
+
+<CodeGroup>
+```yaml Bad Indentation
+rules:
+- id: my-rule
+  match:
+    tool: stripe/refund
+  when: 'args["amount"] > 500'  # Wrong indentation
+  effect: defer
+```
+
+```yaml Good Indentation
+rules:
+  - id: my-rule
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 500'  # Correct indentation
+    effect: defer
+```
+
+```yaml Missing Quotes
+vars:
+  max_refund: 500
+  message: This won't work: it has colons  # Needs quotes
+```
+
+```yaml With Quotes
+vars:
+  max_refund: 500
+  message: "This works: it has colons"  # Quoted
+```
+</CodeGroup>
+
+## Policy Linting
+
+In addition to hard errors, the validator warns about potential issues:
+
+### Warnings
+
+**Unreachable Rule:**
+```
+⚠ warning: rule "permit-refund" is unreachable (shadowed by "permit-all")
+```
+
+This happens when a broad rule matches before a specific rule:
+
+```yaml
+rules:
+  - id: permit-all
+    match:
+      tool: "*"
+    effect: permit
+  
+  - id: permit-refund  # Never reached!
+    match:
+      tool: stripe/refund
+    effect: permit
+```
+
+**Fix:** Reorder rules (specific before general).
+
+**Unused Variable:**
+```
+⚠ warning: variable "unused_threshold" declared but never used
+```
+
+**Fix:** Remove unused variables or use them in a rule condition.
+
+**Missing reason_code:**
+```
+⚠ warning: rule "deny-shell" has no reason_code (recommended for analytics)
+```
+
+**Fix:** Add a `reason_code` for better observability:
+
+```yaml
+- id: deny-shell
+  match:
+    tool: shell/*
+  effect: deny
+  reason: shell commands require approval
+  reason_code: SHELL_DENIED  # Add this
+```
+
+## Validation in Development
+
+During policy development, use `faramesh policy inspect` to view compiled policy structure:
+
+```bash
+faramesh policy inspect policies/demo.yaml
+```
+
+**Output:**
+```
+Policy: policies/demo.yaml
+  version    : 2f8a9c1b
+  agent-id   : demo-agent
+  fpl        : 1.0
+  rules      : 4
+  tools      : 3 declared
+  default    : permit
+
+Rules:
+  deny     deny-destructive-shell        tool=shell/run  when="args[\"cmd\"] matches \"rm\\\\s+-[rf]\""
+  defer    defer-high-value-refund       tool=stripe/refund  when="args[\"amount\"] > vars[\"max_refund\"]"
+  deny     deny-mass-email               tool=send_email  when="len(args[\"recipients\"]) > vars[\"max_ema…"
+  permit   permit-normal-refund          tool=stripe/refund  when="args[\"amount\"] <= vars[\"max_refund\"]"
+```
+
+This shows:
+- Policy version hash
+- Rule count and structure
+- Tool declarations
+- Compiled conditions (truncated)
+
+## Testing Policy Decisions
+
+Validation checks syntax, but doesn't verify policy *behavior*. Use `faramesh policy test` to verify decisions:
+
+```bash
+# Test high-value refund (should defer)
+faramesh policy test policies/demo.yaml \
+  --tool stripe/refund \
+  --args '{"amount":600}'
+
+# Expected:
+#   Effect: defer
+#   Rule:   defer-high-value-refund
+```
+
+Create a test script to verify expected behavior:
+
+```bash
+#!/bin/bash
+# test-policy.sh
+
+test_case() {
+  local tool="$1"
+  local args="$2"
+  local expected_effect="$3"
+  local expected_rule="$4"
+  
+  result=$(faramesh policy test policies/demo.yaml \
+    --tool "$tool" \
+    --args "$args" \
+    --json)
+  
+  effect=$(echo "$result" | jq -r '.effect')
+  rule=$(echo "$result" | jq -r '.rule_id')
+  
+  if [[ "$effect" != "$expected_effect" ]] || [[ "$rule" != "$expected_rule" ]]; then
+    echo "❌ FAIL: $tool with $args"
+    echo "   Expected: $expected_effect ($expected_rule)"
+    echo "   Got:      $effect ($rule)"
+    exit 1
+  else
+    echo "✓ PASS: $tool with $args → $effect"
+  fi
+}
+
+# Run test cases
+test_case "stripe/refund" '{"amount":600}' "defer" "defer-high-value-refund"
+test_case "stripe/refund" '{"amount":100}' "permit" "permit-normal-refund"
+test_case "shell/run" '{"cmd":"rm -rf /"}' "deny" "deny-destructive-shell"
+
+echo "\n✓ All tests passed"
+```
+
+Run in CI:
+
+```yaml
+- name: Test policy decisions
+  run: ./test-policy.sh
+```
+
+## Policy Diffing
+
+Before deploying a policy update, use `faramesh policy diff` to see what changed:
+
+```bash
+faramesh policy diff policies/v1.yaml policies/v2.yaml
+```
+
+**Output:**
+```
+Policy diff
+  old: policies/v1.yaml  [a3f2c1d]  3 rules
+  new: policies/v2.yaml  [9e8b7a6]  4 rules
+
+  + defer-weekend-refund             defer
+  ~ defer-high-value-refund          defer → defer
+```
+
+This shows:
+- **`+`** — Rule added
+- **`-`** — Rule removed
+- **`~`** — Rule modified (effect, condition, or tool pattern changed)
+
+Use this in PR reviews to verify policy changes:
+
+```yaml
+- name: Show policy diff
+  run: |
+    git fetch origin main
+    for policy in policies/*.yaml; do
+      if git show origin/main:"$policy" > /tmp/old.yaml 2>/dev/null; then
+        echo "## Diff: $policy"
+        faramesh policy diff /tmp/old.yaml "$policy"
+      fi
+    done
+```
+
+<Note>
+  Policy diffs are semantic, not textual. Reordering rules, changing comments, or reformatting YAML won't show as changes unless the rule structure actually changed.
+</Note>
+
+## Best Practices
+
+<Steps>
+  <Step title="Validate on every commit">
+    Run `faramesh policy validate` in CI for all policy changes.
+  </Step>
+  
+  <Step title="Test policy decisions">
+    Write test cases for critical rules and run them in CI.
+  </Step>
+  
+  <Step title="Review policy diffs">
+    Use `faramesh policy diff` in PR reviews to understand changes.
+  </Step>
+  
+  <Step title="Use pre-commit hooks">
+    Catch errors locally before pushing to CI.
+  </Step>
+  
+  <Step title="Version your policies">
+    Store policies in version control and track changes over time.
+  </Step>
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Examples" icon="books" href="/policy/examples">
+    Real-world policy examples and patterns
+  </Card>
+  <Card title="Writing Policies" icon="pen" href="/policy/writing-policies">
+    Learn how to write effective policies
+  </Card>
+</CardGroup>

@@ -1,0 +1,116 @@
+---
+title: "faramesh demo"
+description: "Run a synthetic agent demo — the 'docker run hello-world' moment"
+---
+
+## Overview
+
+The `faramesh demo` command runs a synthetic agent against a pre-loaded demo policy to showcase governance decisions in real time. This is the fastest way to see Faramesh in action — zero config, zero infrastructure, results in under 3 seconds.
+
+```bash
+faramesh demo
+```
+
+## What It Does
+
+`faramesh demo` executes 5 synthetic tool calls against an embedded demo policy to demonstrate the three core governance effects:
+
+- **PERMIT** — Tool call allowed
+- **DENY** — Tool call blocked by policy or scanner
+- **DEFER** — Tool call requires human approval
+
+The demo runs entirely in-memory with no disk, socket, or infrastructure requirements.
+
+## Example Output
+
+```bash
+Faramesh — Unified Agent Governance
+Starting synthetic agent with demo policy...
+
+[10:00:15] PERMIT  get_exchange_rate      from=USD to=SEK              latency=11ms
+[10:00:17] DENY    shell/run              cmd="rm -rf /"               scanner=SCANNER_DENY  latency=0ms
+[10:00:18] PERMIT  read_customer          id=cust_abc123               latency=9ms
+[10:00:20] DEFER   stripe/refund          amount=$12,000               awaiting approval  policy=defer-high-value-refund
+[10:00:21] DENY    send_email             recipients=847               policy=deny-mass-email  latency=5ms
+
+─────────────────────────────────────────────
+5 actions evaluated. 2 PERMIT  2 DENY  1 DEFER
+
+Start governing your agent:
+  faramesh serve --policy payment.yaml
+
+Auto-detect your environment:
+  faramesh init
+```
+
+## Demo Scenarios
+
+The demo evaluates these 5 canonical tool calls:
+
+<ParamField path="get_exchange_rate" type="permit">
+  Currency exchange rate lookup (`from=USD`, `to=SEK`). Permitted by default.
+</ParamField>
+
+<ParamField path="shell/run" type="deny">
+  Destructive shell command (`rm -rf /`). Denied by pre-execution scanner.
+</ParamField>
+
+<ParamField path="read_customer" type="permit">
+  Customer data read (`id=cust_abc123`). Permitted by default.
+</ParamField>
+
+<ParamField path="stripe/refund" type="defer">
+  High-value refund (`amount=$12,000`). Deferred for human approval due to threshold policy.
+</ParamField>
+
+<ParamField path="send_email" type="deny">
+  Mass email to 847 recipients. Denied by policy rule for mass communication.
+</ParamField>
+
+## Use Cases
+
+<CardGroup cols={2}>
+  <Card title="First-time evaluation" icon="rocket">
+    Run `faramesh demo` to see governance in action before integrating with your agent.
+  </Card>
+  <Card title="Demo for stakeholders" icon="presentation">
+    Show security, compliance, or product teams how agent governance works.
+  </Card>
+  <Card title="CI smoke test" icon="check">
+    Add `faramesh demo` to CI pipelines to verify the binary works correctly.
+  </Card>
+  <Card title="Onboarding" icon="graduation-cap">
+    Help new team members understand PERMIT/DENY/DEFER effects visually.
+  </Card>
+</CardGroup>
+
+## Technical Details
+
+The demo command:
+- Loads the embedded demo policy from `internal/embedded/demo_policy.yaml`
+- Compiles the policy using the expr-lang engine
+- Creates an in-memory pipeline with:
+  - Policy engine
+  - Null WAL (no disk writes)
+  - In-memory session manager
+  - DEFER workflow (no actual approvals)
+- Evaluates 5 synthetic `CanonicalActionRequest` records
+- Prints color-coded results with decision latency
+
+<Note>
+  The demo runs entirely in-memory. No data is written to disk, and no daemon is started.
+</Note>
+
+## Next Steps
+
+After running the demo:
+
+1. **Generate a config**: `faramesh init` — Auto-detect your environment and generate a policy skeleton
+2. **Start the daemon**: `faramesh serve --policy policy.yaml` — Start governing real agents
+3. **Integrate your agent**: Use the SDK shim or adapter for your environment
+
+## Related Commands
+
+- [`faramesh init`](/cli/init) — Auto-detect environment and generate configuration
+- [`faramesh serve`](/cli/serve) — Start the governance daemon
+- [`faramesh policy validate`](/cli/policy) — Validate a policy file

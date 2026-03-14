@@ -1,0 +1,402 @@
+---
+title: Rule Evaluation
+description: How Faramesh evaluates policies with first-match-wins semantics
+---
+
+Faramesh uses **first-match-wins** semantics for rule evaluation. Rules are evaluated in document order (top-to-bottom), and the first rule that matches determines the governance decision.
+
+## First-Match-Wins Semantics
+
+When a tool call arrives, the policy engine:
+
+<Steps>
+  <Step title="Match tool pattern">
+    Check each rule's `match.tool` pattern against the requested tool ID.
+  </Step>
+  
+  <Step title="Evaluate when condition">
+    If the rule has a `when` condition, evaluate it against the call context.
+  </Step>
+  
+  <Step title="Return effect on match">
+    If both the tool pattern and `when` condition match, return the rule's `effect` immediately. **No further rules are evaluated.**
+  </Step>
+  
+  <Step title="Apply default effect">
+    If no rule matches, apply the policy's `default_effect` (typically `deny`).
+  </Step>
+</Steps>
+
+### Example: Rule Order Matters
+
+```yaml
+rules:
+  # Rule 1: Specific high-value refund
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 500'
+    effect: defer
+  
+  # Rule 2: General refund permit
+  - id: permit-normal-refund
+    match:
+      tool: stripe/refund
+    effect: permit
+  
+  # Rule 3: Never reached for stripe/refund
+  - id: deny-all
+    match:
+      tool: "*"
+    effect: deny
+```
+
+**Evaluation examples:**
+
+| Tool Call | Matching Rule | Effect | Why |
+|-----------|---------------|--------|-----|
+| `stripe/refund` with `amount=600` | Rule 1 | `defer` | Amount exceeds threshold |
+| `stripe/refund` with `amount=100` | Rule 2 | `permit` | Rule 1 doesn't match, Rule 2 does |
+| `http/post` | Rule 3 | `deny` | First two rules don't match |
+
+<Note>
+  Once a rule matches, evaluation stops. In the example above, Rule 3 (`deny-all`) will **never** apply to `stripe/refund` calls because Rules 1 or 2 will always match first.
+</Note>
+
+## Rule Ordering Best Practices
+
+### 1. Specific Rules First, General Rules Last
+
+Order rules from most specific to most general:
+
+```yaml
+rules:
+  # Most specific: exact tool + complex condition
+  - id: defer-high-value-weekend-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 1000 && (time.weekday == 6 || time.weekday == 7)'
+    effect: defer
+  
+  # More specific: exact tool + simple condition
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > 500'
+    effect: defer
+  
+  # Less specific: exact tool, no condition
+  - id: permit-normal-refund
+    match:
+      tool: stripe/refund
+    effect: permit
+  
+  # Least specific: wildcard tool
+  - id: default-deny
+    match:
+      tool: "*"
+    effect: deny
+```
+
+### 2. Deny/Defer Before Permit
+
+Put restrictive rules (deny, defer) before permissive rules:
+
+```yaml
+rules:
+  # Block destructive commands first
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]"'
+    effect: deny
+  
+  # Then permit safe shell commands
+  - id: permit-safe-shell
+    match:
+      tool: shell/run
+    effect: permit
+```
+
+<Warning>
+  If you reverse the order and put `permit-safe-shell` first, the destructive command would be permitted because `permit-safe-shell` would match before `deny-destructive-shell` is evaluated.
+</Warning>
+
+### 3. Use Default Deny as Safety Net
+
+End your rules with a catch-all deny:
+
+```yaml
+rules:
+  # ... specific rules ...
+  
+  # Catch-all deny as last rule
+  - id: default-deny
+    match:
+      tool: "*"
+    effect: deny
+    reason: no matching rule — default deny
+    reason_code: DEFAULT_DENY
+
+default_effect: deny  # Also set this for safety
+```
+
+This creates defense-in-depth: even if you forget to set `default_effect`, the last rule catches everything.
+
+## When Expression Evaluation
+
+The `when` field is an expr-lang expression that must return `true` for the rule to match.
+
+### Evaluation Context
+
+Expressions are evaluated against a context containing:
+
+```yaml
+args:          # Tool call arguments
+  amount: 600
+  currency: USD
+
+vars:          # Policy variables
+  max_refund: 500
+  allowed_domains: ["example.com"]
+
+session:       # Session state
+  call_count: 42
+  cost_usd: 12.50
+  daily_cost_usd: 87.30
+  history: [{tool: "stripe/charge", effect: "permit", timestamp: 1234567890}]
+
+tool:          # Tool metadata
+  reversibility: "compensatable"
+  blast_radius: "external"
+  tags: ["financial"]
+
+time:          # Current time (UTC)
+  hour: 14
+  weekday: 3      # 1=Mon, 7=Sun
+  month: 3
+  day: 14
+```
+
+### Short-Circuit Evaluation
+
+Expr-lang uses short-circuit evaluation for logical operators:
+
+```yaml
+# If args["amount"] <= 500, the second part is never evaluated
+when: 'args["amount"] > 500 && session.daily_cost_usd > 10000'
+```
+
+This is efficient and safe — you can reference session state that might not exist without causing errors.
+
+### Regex Matching
+
+The `matches` operator performs regex matching:
+
+```yaml
+when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs"'
+```
+
+<Note>
+  Use double backslashes (`\\`) in YAML strings to escape regex metacharacters.
+</Note>
+
+### History-Based Rules
+
+Use built-in history functions to detect patterns across multiple calls:
+
+```yaml
+# Defer delete if data was sent externally in the last 2 minutes
+- id: defer-delete-after-exfil
+  match:
+    tool: "delete_*"
+    when: 'history_contains_within("http/post", 120)'
+  effect: defer
+  reason: delete blocked: data was sent to external endpoint recently
+  reason_code: SEQUENCE_EXFIL_DETECTED
+```
+
+See [Policy Syntax](/policy/policy-syntax#built-in-functions) for all available history functions.
+
+## Default Effect Fallback
+
+If no rule matches, Faramesh applies the policy's `default_effect`:
+
+```yaml
+default_effect: deny  # permit | deny | defer
+```
+
+**Best practice:** Use `deny` for security-first policies. Explicitly permit known-safe operations rather than permitting everything by default.
+
+### Example: Default Deny Policy
+
+```yaml
+faramesh-version: "1.0"
+agent-id: "secure-agent"
+default_effect: deny
+
+rules:
+  # Explicitly permit read-only operations
+  - id: allow-http-get
+    match:
+      tool: http/get
+    effect: permit
+  
+  - id: allow-database-read
+    match:
+      tool: db/select
+    effect: permit
+  
+  # Everything else is denied by default_effect
+```
+
+## Performance Characteristics
+
+Faramesh's policy engine is designed for sub-millisecond latency:
+
+### Compilation Phase (Policy Load)
+
+- Policy YAML is parsed and validated
+- All `when` expressions are compiled to expr-lang bytecode
+- Compilation happens **once** at policy load time
+- Invalid expressions cause policy load to fail (fail-fast)
+
+### Evaluation Phase (Per Tool Call)
+
+- Rules are evaluated in order until a match is found
+- Tool pattern matching: **O(1)** for exact match, **O(n)** for glob patterns
+- Condition evaluation: **~1μs** per rule (bytecode execution)
+- **Average case:** 2-3 rules evaluated before match
+- **Worst case:** All rules evaluated, then default effect applied
+
+### Optimization Tips
+
+<Steps>
+  <Step title="Put common rules first">
+    If 90% of calls are `http/get`, put that rule near the top.
+  </Step>
+  
+  <Step title="Use specific tool patterns">
+    Exact matches (`stripe/refund`) are faster than wildcards (`stripe/*`).
+  </Step>
+  
+  <Step title="Keep conditions simple">
+    Simple comparisons (`args["amount"] > 500`) are faster than complex regex or history queries.
+  </Step>
+  
+  <Step title="Avoid unnecessary history queries">
+    History functions scan the session history array. Use them only when needed.
+  </Step>
+</Steps>
+
+### Benchmarks
+
+Typical evaluation latency on modern hardware:
+
+| Scenario | Latency |
+|----------|--------|
+| Simple rule (tool match only) | **~100ns** |
+| Rule with condition (`args["amount"] > 500`) | **~1μs** |
+| Rule with regex (`matches "rm\\s+-[rf]"`) | **~2μs** |
+| Rule with history query | **~5-10μs** |
+| Policy with 50 rules (worst case) | **~50-100μs** |
+
+<Note>
+  Evaluation is always synchronous and blocking. Total latency is typically dominated by network round-trip to the Faramesh server (~1-5ms), not policy evaluation.
+</Note>
+
+## Debugging Rule Evaluation
+
+Use `faramesh policy test` to debug policy decisions:
+
+```bash
+faramesh policy test policies/demo.yaml \
+  --tool stripe/refund \
+  --args '{"amount":600}'
+```
+
+**Output:**
+```
+  Tool:    stripe/refund
+  Effect:  defer
+  Rule:    defer-high-value-refund
+  Reason:  refund exceeds threshold and requires finance approval
+  Code:    HIGH_VALUE_REFUND
+```
+
+The output shows:
+- Which rule matched (`defer-high-value-refund`)
+- The effect applied (`defer`)
+- The reason and reason code
+
+Test multiple scenarios to verify rule ordering:
+
+```bash
+# High-value refund (should defer)
+faramesh policy test policies/demo.yaml \
+  --tool stripe/refund --args '{"amount":600}'
+
+# Normal refund (should permit)
+faramesh policy test policies/demo.yaml \
+  --tool stripe/refund --args '{"amount":100}'
+
+# Unknown tool (should hit default deny)
+faramesh policy test policies/demo.yaml \
+  --tool unknown/tool --args '{}'
+```
+
+## Common Pitfalls
+
+### Pitfall 1: Overly Broad Permit Rule
+
+```yaml
+rules:
+  # BAD: This permits everything, later rules never match
+  - id: permit-all
+    match:
+      tool: "*"
+    effect: permit
+  
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]"'
+    effect: deny  # This will never run!
+```
+
+**Fix:** Move specific deny rules before general permit rules.
+
+### Pitfall 2: Forgetting Default Effect
+
+```yaml
+# No default_effect specified
+rules:
+  - id: permit-http-get
+    match:
+      tool: http/get
+    effect: permit
+  # What happens for other tools?
+```
+
+**Fix:** Always set `default_effect: deny` for security.
+
+### Pitfall 3: Regex Escaping in YAML
+
+```yaml
+# BAD: Single backslash doesn't escape properly in YAML
+when: 'args["cmd"] matches "rm\s+-[rf]"'
+
+# GOOD: Use double backslash
+when: 'args["cmd"] matches "rm\\s+-[rf]"'
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Validation" icon="shield-check" href="/policy/validation">
+    Validate policies in CI and catch errors early
+  </Card>
+  <Card title="Examples" icon="books" href="/policy/examples">
+    Real-world policy examples and patterns
+  </Card>
+</CardGroup>

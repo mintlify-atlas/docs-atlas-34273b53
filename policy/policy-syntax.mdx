@@ -1,0 +1,508 @@
+---
+title: Policy Syntax Reference
+description: Complete YAML schema reference for Faramesh Policy Language (FPL) v1.0
+---
+
+Faramesh policies are written in **YAML** and follow the Faramesh Policy Language (FPL) v1.0 specification. This page documents the complete schema and syntax.
+
+## Top-Level Schema
+
+```yaml
+faramesh-version: "1.0"
+agent-id: "my-agent"
+default_effect: deny
+
+vars:
+  # Policy variables
+
+tools:
+  # Tool metadata declarations
+
+budget:
+  # Cost and call limits
+
+rules:
+  # Governance rules
+```
+
+### Required Fields
+
+<ParamField path="faramesh-version" type="string" required>
+  Policy language version. Must be `"1.0"` for FPL v1.0.
+</ParamField>
+
+<ParamField path="agent-id" type="string" required>
+  Unique identifier for the agent this policy governs. Used for audit trails and multi-agent orchestration.
+</ParamField>
+
+<ParamField path="rules" type="array" required>
+  List of governance rules. Each rule is evaluated in document order (first-match-wins).
+</ParamField>
+
+### Optional Fields
+
+<ParamField path="default_effect" type="string" default="deny">
+  Fallback effect when no rule matches. Valid values: `permit`, `deny`, `defer`.
+  
+  **Best practice:** Use `deny` for security-first policies.
+</ParamField>
+
+<ParamField path="vars" type="object">
+  Policy variables accessible in rule conditions via `vars["key"]`. Supports any JSON-serializable value.
+  
+  ```yaml
+  vars:
+    max_refund: 500
+    allowed_domains:
+      - internal.example.com
+      - api.company.com
+    feature_flags:
+      enable_auto_approve: true
+  ```
+</ParamField>
+
+<ParamField path="tools" type="object">
+  Tool metadata declarations. Keys are tool IDs; values are tool metadata objects.
+</ParamField>
+
+<ParamField path="budget" type="object">
+  Cost and call limits enforced pre-execution. See [Budget Configuration](#budget-configuration).
+</ParamField>
+
+## vars Section
+
+The `vars` section defines policy variables that can be referenced in rule conditions. Variables make policies more maintainable by extracting configuration into one place.
+
+```yaml
+vars:
+  # Scalar values
+  max_refund: 500
+  max_email_recipients: 50
+  
+  # Arrays
+  allowed_domains:
+    - internal.example.com
+    - api.company.com
+    - cdn.example.com
+  
+  # Nested objects
+  approval_tiers:
+    tier1: 100
+    tier2: 500
+    tier3: 1000
+  
+  # Booleans
+  strict_mode: true
+```
+
+### Accessing Variables in Conditions
+
+Use `vars["key"]` syntax in expr-lang conditions:
+
+```yaml
+rules:
+  - id: check-refund-threshold
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+  
+  - id: check-domain-allowlist
+    match:
+      tool: http/post
+      when: '!contains(vars["allowed_domains"], args["domain"])'
+    effect: deny
+```
+
+## tools Section
+
+The `tools` section declares metadata about governed tools. This metadata is available in rule conditions via the `tool.*` context variables.
+
+```yaml
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial]
+    cost_usd: 0.25
+  
+  shell/run:
+    reversibility: irreversible
+    blast_radius: local
+    shadow_safe: false
+    tags: [system]
+  
+  read_customer:
+    reversibility: read_only
+    blast_radius: none
+    shadow_safe: true
+    tags: [pii_source]
+```
+
+### Tool Metadata Fields
+
+<ParamField path="reversibility" type="string">
+  How easily the tool's effects can be undone.
+  
+  - **`read_only`**: No side effects (e.g., database queries, HTTP GET)
+  - **`reversible`**: Can be undone trivially (e.g., create/delete file)
+  - **`compensatable`**: Can be undone with compensating action (e.g., refund/charge)
+  - **`irreversible`**: Cannot be undone (e.g., send email, delete production data)
+  
+  **Example condition:**
+  ```yaml
+  when: 'tool.reversibility == "irreversible"'
+  ```
+</ParamField>
+
+<ParamField path="blast_radius" type="string">
+  Scope of potential damage from misuse.
+  
+  - **`none`**: No risk (read-only)
+  - **`local`**: Affects local agent state only
+  - **`scoped`**: Affects a limited scope (e.g., single user, single resource)
+  - **`system`**: Affects entire system (e.g., database schema changes)
+  - **`external`**: Affects external systems or customers
+  
+  **Example condition:**
+  ```yaml
+  when: 'tool.blast_radius == "external" && args["amount"] > 1000'
+  ```
+</ParamField>
+
+<ParamField path="shadow_safe" type="boolean">
+  Whether the tool can safely run in shadow mode (dry-run without side effects).
+  
+  Set to `true` for read-only operations, `false` for anything with side effects.
+</ParamField>
+
+<ParamField path="tags" type="array">
+  String tags for categorization and filtering.
+  
+  Common tags: `financial`, `system`, `communication`, `pii_source`, `destructive`
+  
+  **Example condition:**
+  ```yaml
+  when: 'contains(tool.tags, "financial")'
+  ```
+</ParamField>
+
+<ParamField path="cost_usd" type="number">
+  Estimated cost in USD per successful call. Used for budget enforcement.
+  
+  For dynamic-cost tools, set this to the base/minimum cost.
+</ParamField>
+
+## rules Section
+
+Rules are the core of your policy. Each rule defines a condition and the effect to apply when that condition matches.
+
+```yaml
+rules:
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]"'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+    incident_category: destructive_command
+    incident_severity: critical
+```
+
+### Rule Fields
+
+<ParamField path="id" type="string" required>
+  Unique identifier for the rule. Must be unique within the policy.
+  
+  Appears in:
+  - Audit logs
+  - Decision API responses
+  - Approval UIs
+  - Metrics and analytics
+  
+  **Naming convention:** Use lowercase with hyphens (e.g., `defer-high-value-refund`).
+</ParamField>
+
+<ParamField path="match" type="object" required>
+  Defines when this rule applies. Contains `tool` pattern and optional `when` condition.
+</ParamField>
+
+<ParamField path="match.tool" type="string" required>
+  Glob pattern matching tool IDs. Supports:
+  
+  - **Exact match:** `"stripe/refund"`
+  - **Prefix match:** `"stripe/*"` (matches `stripe/refund`, `stripe/charge`, etc.)
+  - **Match all:** `"*"`
+  
+  Patterns use path.Match semantics from Go's standard library.
+</ParamField>
+
+<ParamField path="match.when" type="string">
+  Optional expr-lang expression evaluated against call context. Rule only matches if this expression returns `true`.
+  
+  Available variables:
+  - `args` — Tool call arguments
+  - `vars` — Policy variables
+  - `session` — Session context (call_count, history, cost_usd, daily_cost_usd)
+  - `tool` — Tool metadata (reversibility, blast_radius, tags)
+  - `principal` — Caller identity (if configured)
+  - `time` — Temporal context (hour, weekday, month, day)
+  
+  See [Expression Language](#expression-language) for details.
+</ParamField>
+
+<ParamField path="effect" type="string" required>
+  Governance decision if the rule matches.
+  
+  - **`permit`** (or `allow`): Allow the action to proceed
+  - **`deny`** (or `halt`): Block the action immediately
+  - **`defer`** (or `abstain`): Require human approval before proceeding
+</ParamField>
+
+<ParamField path="reason" type="string" required>
+  Human-readable explanation shown to operators and end users.
+  
+  **Best practice:** Explain *why* the decision was made, not just what was decided.
+</ParamField>
+
+<ParamField path="reason_code" type="string">
+  Machine-readable code for analytics, alerting, and automation.
+  
+  **Convention:** Use SCREAMING_SNAKE_CASE (e.g., `HIGH_VALUE_REFUND`, `DESTRUCTIVE_SHELL_COMMAND`).
+</ParamField>
+
+<ParamField path="incident_category" type="string">
+  Category for incident tracking and reporting.
+  
+  Examples: `financial_threshold`, `destructive_command`, `mass_operation`, `data_exfiltration`
+</ParamField>
+
+<ParamField path="incident_severity" type="string">
+  Severity level for incidents: `low`, `medium`, `high`, `critical`.
+</ParamField>
+
+## Expression Language
+
+The `when` field uses **expr-lang**, a fast expression language with Go-like syntax. Expressions are compiled to bytecode at policy load time and evaluated at ~1μs per rule.
+
+### Available Variables
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `args` | `map[string]any` | Tool call arguments (e.g., `args["amount"]`) |
+| `vars` | `map[string]any` | Policy variables (e.g., `vars["max_refund"]`) |
+| `session.call_count` | `int64` | Total calls in current session |
+| `session.history` | `array` | Recent tool calls (newest first) |
+| `session.cost_usd` | `float64` | Session cost in USD |
+| `session.daily_cost_usd` | `float64` | Daily cost in USD |
+| `tool.reversibility` | `string` | Tool reversibility property |
+| `tool.blast_radius` | `string` | Tool blast radius |
+| `tool.tags` | `array` | Tool tags |
+| `time.hour` | `int` | Current hour (0-23, UTC) |
+| `time.weekday` | `int` | Day of week (1=Mon, 7=Sun) |
+| `time.month` | `int` | Month (1-12) |
+| `time.day` | `int` | Day of month (1-31) |
+
+### Operators
+
+| Operator | Description | Example |
+|----------|-------------|--------|
+| `+`, `-`, `*`, `/`, `%` | Arithmetic | `args["amount"] > 500` |
+| `==`, `!=`, `<`, `<=`, `>`, `>=` | Comparison | `args["amount"] >= vars["max_refund"]` |
+| `&&`, `\|\|`, `!` | Logical | `args["amount"] > 500 && tool.blast_radius == "external"` |
+| `matches` | Regex match | `args["cmd"] matches "rm\\s+-[rf]"` |
+| `contains` | String/array contains | `contains(tool.tags, "financial")` |
+| `in` | Membership test | `args["domain"] in vars["allowed_domains"]` |
+| `len` | Array/string length | `len(args["recipients"]) > 50` |
+
+### Built-in Functions
+
+<ParamField path="history_contains_within(pattern, seconds)" type="function">
+  Returns `true` if any call matching `pattern` occurred within the last `seconds` seconds.
+  
+  ```yaml
+  when: 'history_contains_within("http/post", 120)'
+  ```
+</ParamField>
+
+<ParamField path="history_sequence(tool_a, tool_b, ...)" type="function">
+  Returns `true` if the given tools appear in that order in the session history.
+  
+  ```yaml
+  when: 'history_sequence("read_file", "http/post")'
+  ```
+</ParamField>
+
+<ParamField path="history_tool_count(pattern)" type="function">
+  Returns the count of calls matching `pattern` in the session history.
+  
+  ```yaml
+  when: 'history_tool_count("stripe/*") > 5'
+  ```
+</ParamField>
+
+<ParamField path="contains(array, item)" type="function">
+  Returns `true` if `item` is in `array`.
+  
+  ```yaml
+  when: 'contains(tool.tags, "financial")'
+  ```
+</ParamField>
+
+### Example Conditions
+
+<CodeGroup>
+```yaml Amount threshold
+when: 'args["amount"] > vars["max_refund"]'
+```
+
+```yaml Regex pattern matching
+when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs"'
+```
+
+```yaml Array length check
+when: 'len(args["recipients"]) > vars["max_email_recipients"]'
+```
+
+```yaml Tag membership
+when: 'contains(tool.tags, "financial") && args["amount"] > 1000'
+```
+
+```yaml Time-based restriction
+when: 'time.hour < 9 || time.hour > 17 || time.weekday > 5'
+```
+
+```yaml Session budget check
+when: 'session.daily_cost_usd + args["amount"] > 10000'
+```
+
+```yaml History-based detection
+when: 'history_contains_within("http/post", 120) && tool.reversibility == "irreversible"'
+```
+</CodeGroup>
+
+## Budget Configuration
+
+The optional `budget` section enforces cost and call limits pre-execution:
+
+```yaml
+budget:
+  daily_usd: 100.00
+  session_usd: 10.00
+  max_calls: 500
+  on_exceed: deny
+```
+
+<ParamField path="daily_usd" type="number">
+  Maximum USD spend per calendar day (UTC). Persisted across restarts.
+</ParamField>
+
+<ParamField path="session_usd" type="number">
+  Maximum USD spend per session.
+</ParamField>
+
+<ParamField path="max_calls" type="number">
+  Maximum total tool calls per session (all tools).
+</ParamField>
+
+<ParamField path="on_exceed" type="string" default="deny">
+  Effect when a limit is hit: `deny` or `defer`.
+</ParamField>
+
+<Note>
+  Budget enforcement requires tool cost declarations in the `tools` section. Set `cost_usd` for each billable tool.
+</Note>
+
+## Complete Example
+
+```yaml
+faramesh-version: "1.0"
+agent-id: "payment-agent"
+default_effect: deny
+
+vars:
+  max_refund: 500
+  max_email_recipients: 50
+  allowed_domains:
+    - internal.example.com
+    - api.company.com
+
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial]
+    cost_usd: 0.25
+  shell/run:
+    reversibility: irreversible
+    blast_radius: local
+    shadow_safe: false
+    tags: [system]
+  send_email:
+    reversibility: irreversible
+    blast_radius: external
+    shadow_safe: false
+    tags: [communication]
+
+budget:
+  daily_usd: 100.00
+  max_calls: 500
+  on_exceed: deny
+
+rules:
+  # Deny destructive shell commands
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs"'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+    incident_category: destructive_command
+    incident_severity: critical
+  
+  # Require approval for high-value refunds
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold and requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+    incident_category: financial_threshold
+    incident_severity: high
+  
+  # Deny mass emails
+  - id: deny-mass-email
+    match:
+      tool: send_email
+      when: 'len(args["recipients"]) > vars["max_email_recipients"]'
+    effect: deny
+    reason: mass email to more than 50 recipients requires manual review
+    reason_code: MASS_EMAIL_LIMIT
+    incident_category: mass_operation
+    incident_severity: medium
+  
+  # Permit normal refunds
+  - id: permit-normal-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] <= vars["max_refund"]'
+    effect: permit
+    reason: refund within authorized threshold
+    reason_code: WITHIN_THRESHOLD
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Rule Evaluation" icon="list-check" href="/policy/rule-evaluation">
+    Understand first-match-wins and performance
+  </Card>
+  <Card title="Validation" icon="shield-check" href="/policy/validation">
+    Validate policies in CI
+  </Card>
+</CardGroup>

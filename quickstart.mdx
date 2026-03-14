@@ -1,80 +1,224 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Get started with Faramesh in 5 minutes"
 ---
 
-## Get started in three steps
+Get Faramesh running and see governance in action in under 5 minutes.
 
-Get your documentation site running locally and make your first customization.
+<Steps>
 
-### Step 1: Set up your local environment
+<Step title="Install Faramesh">
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+Choose your preferred installation method:
 
-### Step 2: Deploy your changes
+<CodeGroup>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+```bash Homebrew (macOS/Linux)
+brew install faramesh/tap/faramesh
+```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+```bash Install Script
+curl -fsSL https://raw.githubusercontent.com/faramesh/faramesh-core/main/install.sh | sh
+```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+```bash Docker
+docker pull ghcr.io/faramesh/faramesh:latest
+```
 
-### Step 3: Go live
+```bash Go
+go install github.com/faramesh/faramesh-core/cmd/faramesh@latest
+```
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+```bash Python SDK
+pip install faramesh
+```
 
-## Next steps
+</CodeGroup>
 
-Now that you have your docs running, explore these key features:
+Verify the installation:
 
-<CardGroup cols={2}>
+```bash
+faramesh --version
+```
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+</Step>
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+<Step title="Run the Demo">
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+See Faramesh in action with a synthetic agent:
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+```bash
+faramesh demo
+```
 
-</CardGroup>
+**Output:**
+
+```
+Faramesh — Unified Agent Governance
+Starting synthetic agent with demo policy...
+
+[10:00:15] PERMIT  get_exchange_rate      from=USD to=SEK              latency=11ms
+[10:00:17] DENY    shell/run              cmd="rm -rf /"               scanner=SCANNER_DENY  latency=0ms
+[10:00:18] PERMIT  read_customer          id=cust_abc123               latency=9ms
+[10:00:20] DEFER   stripe/refund          amount=$12,000               awaiting approval  policy=defer-high-value-refund
+[10:00:21] DENY    send_email             recipients=847               policy=deny-mass-email  latency=5ms
+
+─────────────────────────────────────────────
+5 actions evaluated. 2 PERMIT  2 DENY  1 DEFER
+```
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+Zero config. Zero infrastructure. PERMIT/DENY/DEFER in under 3 seconds.
 </Note>
+
+</Step>
+
+<Step title="Govern Your First Tool">
+
+Add governance to a Python function in under 60 seconds:
+
+```python
+from faramesh import govern
+
+def stripe_refund(amount: float, currency: str) -> str:
+    """Refund a charge via Stripe."""
+    # Your Stripe API call here
+    return f"Refunded {amount} {currency}"
+
+# Wrap with govern() - preserves type hints and docstrings
+governed_refund = govern(
+    stripe_refund, 
+    policy='payment.yaml', 
+    agent_id='payment-bot'
+)
+
+# Use it like the original function
+try:
+    result = governed_refund(amount=100, currency='usd')
+    print(result)  # "Refunded 100 usd"
+except DenyError as e:
+    print(f"DENY: {e.reason}")
+except DeferredError as e:
+    print(f"DEFER: approve with: faramesh agent approve {e.defer_token}")
+```
+
+<Info>
+The `govern()` decorator auto-starts the faramesh daemon on first call. No separate setup in development.
+</Info>
+
+</Step>
+
+<Step title="Create Your First Policy">
+
+Create `payment.yaml` with governance rules:
+
+```yaml payment.yaml
+faramesh-version: '1.0'
+agent-id: payment-bot
+default_effect: permit
+
+vars:
+  max_refund: 500
+
+rules:
+  # Deny destructive shell commands
+  - id: deny-destructive-shell
+    match:
+      tool: shell/run
+      when: 'args["cmd"] matches "rm\\s+-[rf]"'
+    effect: deny
+    reason: destructive shell command blocked by policy
+    reason_code: DESTRUCTIVE_SHELL_COMMAND
+
+  # Require human approval for high-value refunds
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold — requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+
+  # Deny mass email
+  - id: deny-mass-email
+    match:
+      tool: send_email
+      when: 'len(args["recipients"]) > 50'
+    effect: deny
+    reason: mass email to >50 recipients requires manual review
+    reason_code: MASS_EMAIL_LIMIT
+```
+
+Validate your policy:
+
+```bash
+faramesh policy validate payment.yaml
+```
+
+</Step>
+
+<Step title="Start the Daemon (Production)">
+
+For production deployments, run the daemon as a service:
+
+```bash
+faramesh serve --policy payment.yaml
+```
+
+The daemon:
+- Loads and compiles the policy
+- Opens the WAL (write-ahead log)
+- Initializes the DPR (Decision-Provenance Record) chain
+- Starts accepting connections on `/tmp/faramesh.sock`
+
+<Tip>
+Use `faramesh init` to auto-detect your environment and generate appropriate configs (Kubernetes, Lambda, Docker, etc.)
+</Tip>
+
+</Step>
+
+</Steps>
+
+## Understanding the Three Decision Modes
+
+<CardGroup cols={3}>
+  <Card title="PERMIT" icon="check" color="#10b981">
+    Action is allowed and executes immediately
+  </Card>
+  <Card title="DENY" icon="ban" color="#ef4444">
+    Action is blocked before execution
+  </Card>
+  <Card title="DEFER" icon="clock" color="#f59e0b">
+    Execution pauses until human approves/denies
+  </Card>
+</CardGroup>
+
+## What Just Happened?
+
+1. **Policy Compilation**: The YAML policy was parsed and expr-lang conditions compiled to bytecode (~1μs per rule)
+2. **Governance Pipeline**: Each tool call went through an 11-step evaluation pipeline
+3. **WAL-First Audit**: Every decision was written to disk BEFORE being returned (tamper-evident)
+4. **DPR Chain**: All decisions recorded in a cryptographic chain with SHA256 hashes
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Core Concepts" icon="book" href="/concepts/architecture">
+    Understand the architecture and governance pipeline
+  </Card>
+  <Card title="Policy Development" icon="file-code" href="/policy/writing-policies">
+    Learn to write sophisticated policies
+  </Card>
+  <Card title="Python SDK Guide" icon="python" href="/guides/python-sdk">
+    Deep dive into the govern() decorator
+  </Card>
+  <Card title="CLI Reference" icon="terminal" href="/cli/demo">
+    Explore all CLI commands
+  </Card>
+</CardGroup>
+
+## Need Help?
+
+- [GitHub Issues](https://github.com/faramesh/faramesh-core/issues) — Report bugs or request features
+- [Security Policy](https://github.com/faramesh/faramesh-core/blob/main/SECURITY.md) — Report security vulnerabilities
+- [Contributing Guide](https://github.com/faramesh/faramesh-core/blob/main/CONTRIBUTING.md) — Contribute to Faramesh

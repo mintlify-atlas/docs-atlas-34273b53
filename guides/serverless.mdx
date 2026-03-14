@@ -1,0 +1,591 @@
+---
+title: Serverless Mode
+description: Run Faramesh governance in AWS Lambda, Google Cloud Functions, and Cloud Run — no daemon, no network hop
+---
+
+The Serverless adapter (A4) runs the Faramesh governance engine **inside** your serverless function. No daemon, no network hop, no cold-start penalty. Policy is loaded from environment variables or embedded in the deployment.
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Lambda / Cloud Function / Cloud Run                         │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  Agent Code                                            │ │
+│  │                                                        │ │
+│  │  guard.Govern(tool_id, args)                          │ │
+│  └────────────────┬───────────────────────────────────────┘ │
+│                   │                                          │
+│                   ▼                                          │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  In-Process Faramesh Guard                            │ │
+│  │                                                        │ │
+│  │  1. Load policy from env var or embedded file        │ │
+│  │  2. Evaluate: Pipeline → Decision                     │ │
+│  │  3. Write DPR to /tmp/faramesh-dpr.db (optional)      │ │
+│  │  4. Return: PERMIT | DENY | DEFER | SHADOW           │ │
+│  └────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Key difference from daemon mode:** The governance engine runs inside your function process. No Unix socket, no external daemon.
+
+## Installation
+
+<Tabs>
+  <Tab title="Python">
+    ```bash
+    pip install faramesh
+    ```
+  </Tab>
+  <Tab title="Go">
+    ```bash
+    go get github.com/faramesh/faramesh-core/internal/adapter/serverless
+    ```
+  </Tab>
+  <Tab title="Node.js">
+    ```bash
+    npm install @faramesh/serverless
+    ```
+  </Tab>
+</Tabs>
+
+## Quick Start (Python + Lambda)
+
+### 1. Write Your Function
+
+```python lambda_function.py
+import os
+from faramesh.serverless import Guard
+
+# Initialize guard once (cold start)
+# Policy loaded from environment variable or inline
+guard = Guard(
+    policy_yaml=os.environ.get('FARAMESH_POLICY'),
+    agent_id='payment-lambda'
+)
+
+def lambda_handler(event, context):
+    # Governance decision
+    decision = guard.govern(
+        tool_id='stripe/refund',
+        args={'amount': event['amount'], 'currency': 'usd'}
+    )
+
+    if decision['effect'] == 'DENY':
+        return {
+            'statusCode': 403,
+            'body': f"Denied: {decision['reason']}"
+        }
+
+    if decision['effect'] == 'DEFER':
+        return {
+            'statusCode': 202,
+            'body': f"Requires approval: {decision['defer_token']}"
+        }
+
+    # PERMIT — execute the tool
+    result = stripe_refund(event['amount'], event['currency'])
+    return {
+        'statusCode': 200,
+        'body': result
+    }
+
+def stripe_refund(amount, currency):
+    # Your Stripe API call here
+    return f"Refunded {amount} {currency}"
+```
+
+### 2. Embed Policy
+
+<Tabs>
+  <Tab title="Environment Variable">
+    ```yaml
+    # Store policy.yaml content in FARAMESH_POLICY env var
+    FARAMESH_POLICY: |
+      faramesh-version: '1.0'
+      agent-id: payment-lambda
+      default_effect: permit
+      vars:
+        max_refund: 500
+      rules:
+        - id: defer-high-value-refund
+          match:
+            tool: stripe/refund
+            when: 'args["amount"] > vars["max_refund"]'
+          effect: defer
+          reason: refund exceeds threshold
+          reason_code: HIGH_VALUE_REFUND
+    ```
+  </Tab>
+  <Tab title="AWS SSM Parameter">
+    ```python
+    import boto3
+
+    ssm = boto3.client('ssm')
+    policy_yaml = ssm.get_parameter(
+        Name='/faramesh/payment-policy',
+        WithDecryption=False
+    )['Parameter']['Value']
+
+    guard = Guard(policy_yaml=policy_yaml, agent_id='payment-lambda')
+    ```
+  </Tab>
+  <Tab title="Embedded File">
+    ```python
+    # Include policy.yaml in deployment package
+    guard = Guard(
+        policy_path='policy.yaml',
+        agent_id='payment-lambda'
+    )
+    ```
+  </Tab>
+</Tabs>
+
+### 3. Deploy to Lambda
+
+```bash
+# Package dependencies
+pip install faramesh -t package/
+cp lambda_function.py package/
+cd package && zip -r ../deployment.zip . && cd ..
+
+# Create Lambda function
+aws lambda create-function \
+  --function-name payment-lambda \
+  --runtime python3.11 \
+  --role arn:aws:iam::ACCOUNT:role/lambda-role \
+  --handler lambda_function.lambda_handler \
+  --zip-file fileb://deployment.zip \
+  --environment Variables="{FARAMESH_POLICY=$(cat policy.yaml | base64)}"
+```
+
+## API Reference
+
+### `Guard` (Python)
+
+```python
+from faramesh.serverless import Guard
+
+guard = Guard(
+    policy_yaml: str = None,
+    policy_path: str = None,
+    agent_id: str = None,
+    dpr_path: str = '/tmp/faramesh-dpr.db'
+)
+```
+
+**Parameters:**
+
+- `policy_yaml` — Inline policy YAML string (from env var or SSM)
+- `policy_path` — Path to policy YAML file (embedded in deployment)
+- `agent_id` — Agent identity (falls back to `FARAMESH_AGENT_ID` env var)
+- `dpr_path` — SQLite DPR store path (default: `/tmp/faramesh-dpr.db`)
+
+**Methods:**
+
+#### `govern(tool_id, args)`
+
+```python
+decision = guard.govern(
+    tool_id='stripe/refund',
+    args={'amount': 100, 'currency': 'usd'}
+)
+```
+
+**Returns:** `dict` with keys:
+
+- `effect` — `"PERMIT"` | `"DENY"` | `"DEFER"` | `"SHADOW"`
+- `rule_id` — ID of the matched rule (empty for default)
+- `reason` — Human-readable explanation
+- `reason_code` — Machine-readable code
+- `defer_token` — Token for approval (when `effect == "DEFER"`)
+- `latency_ms` — Evaluation latency in milliseconds
+
+### `Guard` (Go)
+
+```go
+import "github.com/faramesh/faramesh-core/internal/adapter/serverless"
+
+guard, err := serverless.NewGuard(serverless.GuardConfig{
+    PolicyYAML: os.Getenv("FARAMESH_POLICY"),
+    AgentID:    "payment-lambda",
+    DPRPath:    "/tmp/faramesh-dpr.db",
+})
+
+decision := guard.Govern(ctx, "stripe/refund", map[string]any{
+    "amount":   100,
+    "currency": "usd",
+})
+
+if decision.Effect == core.EffectDeny {
+    return fmt.Errorf("denied: %s", decision.Reason)
+}
+```
+
+## Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|--------|
+| `FARAMESH_POLICY` | Inline policy YAML | `""` |
+| `FARAMESH_AGENT_ID` | Agent identity | `"serverless-agent"` |
+| `AWS_REQUEST_ID` | Lambda request ID (auto-detected, used as session ID) | Auto |
+| `FUNCTION_EXECUTION_ID` | GCP function execution ID (auto-detected) | Auto |
+
+## Cold Start Optimization
+
+The serverless adapter is optimized for cold starts:
+
+- **Policy compilation:** less than 50ms (YAML parse + expr compile)
+- **DPR store:** Optional; set `dpr_path=""` to disable
+- **No network calls:** Policy is embedded or loaded from env
+
+**Best practices:**
+
+<Steps>
+
+<Step title="Initialize guard globally">
+```python
+# GOOD: Guard initialized once per container
+guard = Guard(policy_yaml=os.environ['FARAMESH_POLICY'])
+
+def lambda_handler(event, context):
+    decision = guard.govern('tool', args)
+```
+
+```python
+# BAD: Guard re-initialized on every invocation
+def lambda_handler(event, context):
+    guard = Guard(policy_yaml=os.environ['FARAMESH_POLICY'])  # ❌ Slow
+    decision = guard.govern('tool', args)
+```
+</Step>
+
+<Step title="Disable DPR for ultra-low latency">
+```python
+guard = Guard(
+    policy_yaml=os.environ['FARAMESH_POLICY'],
+    dpr_path=''  # Disable SQLite writes
+)
+```
+
+<Warning>
+Disabling DPR means no local audit trail. Use Horizon sync instead.
+</Warning>
+</Step>
+
+<Step title="Use environment variables for policy">
+Faster than reading from disk or SSM on every cold start:
+
+```python
+guard = Guard(policy_yaml=os.environ['FARAMESH_POLICY'])
+```
+</Step>
+
+</Steps>
+
+## AWS Lambda Setup
+
+### Deployment Package
+
+<Steps>
+
+<Step title="Create deployment package">
+```bash
+mkdir package
+pip install faramesh -t package/
+cp lambda_function.py package/
+cp policy.yaml package/  # Optional: embed policy
+cd package && zip -r ../deployment.zip . && cd ..
+```
+</Step>
+
+<Step title="Create Lambda function">
+```bash
+aws lambda create-function \
+  --function-name payment-lambda \
+  --runtime python3.11 \
+  --role arn:aws:iam::ACCOUNT:role/lambda-role \
+  --handler lambda_function.lambda_handler \
+  --zip-file fileb://deployment.zip \
+  --timeout 30 \
+  --memory-size 512 \
+  --environment Variables="{FARAMESH_POLICY=$(cat policy.yaml)}"
+```
+</Step>
+
+<Step title="Test invocation">
+```bash
+aws lambda invoke \
+  --function-name payment-lambda \
+  --payload '{"amount": 100, "currency": "usd"}' \
+  response.json
+
+cat response.json
+```
+</Step>
+
+</Steps>
+
+### Lambda Layer (Recommended)
+
+Package Faramesh as a Lambda Layer for reuse across functions:
+
+```bash
+# Create layer
+mkdir -p layer/python
+pip install faramesh -t layer/python/
+cd layer && zip -r ../faramesh-layer.zip . && cd ..
+
+# Publish layer
+aws lambda publish-layer-version \
+  --layer-name faramesh \
+  --zip-file fileb://faramesh-layer.zip \
+  --compatible-runtimes python3.11
+
+# Attach to function
+aws lambda update-function-configuration \
+  --function-name payment-lambda \
+  --layers arn:aws:lambda:REGION:ACCOUNT:layer:faramesh:1
+```
+
+## Google Cloud Functions
+
+### Deployment
+
+```bash
+# requirements.txt
+faramesh==1.0.0
+
+# main.py
+import os
+from faramesh.serverless import Guard
+
+guard = Guard(
+    policy_yaml=os.environ['FARAMESH_POLICY'],
+    agent_id='payment-function'
+)
+
+def payment_handler(request):
+    data = request.get_json()
+    decision = guard.govern(
+        tool_id='stripe/refund',
+        args={'amount': data['amount'], 'currency': 'usd'}
+    )
+
+    if decision['effect'] == 'DENY':
+        return {'error': decision['reason']}, 403
+
+    # PERMIT — execute
+    return {'status': 'refunded'}, 200
+
+# Deploy
+gcloud functions deploy payment-handler \
+  --runtime python311 \
+  --trigger-http \
+  --entry-point payment_handler \
+  --set-env-vars FARAMESH_POLICY="$(cat policy.yaml)"
+```
+
+## Cloud Run
+
+### Dockerfile
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY . .
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+```
+
+### Application
+
+```python main.py
+import os
+from fastapi import FastAPI, HTTPException
+from faramesh.serverless import Guard
+
+app = FastAPI()
+
+guard = Guard(
+    policy_yaml=os.environ['FARAMESH_POLICY'],
+    agent_id='payment-service'
+)
+
+@app.post('/refund')
+def refund(amount: float, currency: str):
+    decision = guard.govern(
+        tool_id='stripe/refund',
+        args={'amount': amount, 'currency': currency}
+    )
+
+    if decision['effect'] == 'DENY':
+        raise HTTPException(status_code=403, detail=decision['reason'])
+
+    # PERMIT — execute refund
+    return {'status': 'refunded', 'amount': amount}
+```
+
+### Deploy
+
+```bash
+# Build and push
+docker build -t gcr.io/PROJECT/payment-service .
+docker push gcr.io/PROJECT/payment-service
+
+# Deploy to Cloud Run
+gcloud run deploy payment-service \
+  --image gcr.io/PROJECT/payment-service \
+  --platform managed \
+  --region us-central1 \
+  --set-env-vars FARAMESH_POLICY="$(cat policy.yaml)"
+```
+
+## DEFER in Serverless
+
+DEFER works differently in serverless mode:
+
+<Warning>
+Serverless functions cannot block waiting for approval (no long-running connections). DEFER returns immediately with a token.
+</Warning>
+
+### Pattern 1: Return Token to Caller
+
+```python
+def lambda_handler(event, context):
+    decision = guard.govern('stripe/refund', event['args'])
+
+    if decision['effect'] == 'DEFER':
+        return {
+            'statusCode': 202,
+            'body': {
+                'status': 'pending_approval',
+                'defer_token': decision['defer_token'],
+                'approve_url': f"https://app.example.com/approve/{decision['defer_token']}"
+            }
+        }
+```
+
+### Pattern 2: Queue for Async Processing
+
+```python
+import boto3
+
+sqs = boto3.client('sqs')
+
+def lambda_handler(event, context):
+    decision = guard.govern('stripe/refund', event['args'])
+
+    if decision['effect'] == 'DEFER':
+        # Queue for manual approval
+        sqs.send_message(
+            QueueUrl='https://sqs.us-east-1.amazonaws.com/ACCOUNT/approvals',
+            MessageBody=json.dumps({
+                'defer_token': decision['defer_token'],
+                'tool_id': 'stripe/refund',
+                'args': event['args'],
+                'timestamp': time.time()
+            })
+        )
+        return {'statusCode': 202, 'body': 'Queued for approval'}
+```
+
+## Monitoring and Audit
+
+### DPR Store in /tmp
+
+Lambda's `/tmp` is writable but ephemeral. DPR records are written but lost when the container is recycled.
+
+**Options:**
+
+1. **Disable local DPR** (set `dpr_path=""`)
+2. **Sync to S3** after each invocation
+3. **Use Horizon sync** (cloud-based audit trail)
+
+### Horizon Sync (Recommended)
+
+```python
+import os
+from faramesh.serverless import Guard
+
+guard = Guard(
+    policy_yaml=os.environ['FARAMESH_POLICY'],
+    agent_id='payment-lambda',
+    dpr_path='',  # Disable local DPR
+    horizon_token=os.environ['HORIZON_TOKEN'],  # Cloud sync
+    horizon_url='https://api.faramesh.dev'
+)
+```
+
+All DPR records are streamed to Faramesh Horizon in real-time.
+
+## Performance Benchmarks
+
+| Environment | Cold Start | Warm Invocation | Policy Eval |
+|-------------|------------|-----------------|-------------|
+| Lambda (Python 3.11, 512MB) | ~200ms | ~5ms | ~1ms |
+| Lambda (Go, 512MB) | ~100ms | ~2ms | ~0.5ms |
+| Cloud Run (Python, 1GB) | ~300ms | ~5ms | ~1ms |
+
+**Optimization tips:**
+
+- Use provisioned concurrency to eliminate cold starts
+- Disable DPR for minimal latency
+- Embed policy in env var (faster than SSM/Secrets Manager)
+
+## Troubleshooting
+
+### Policy not loading
+
+**Error:**
+
+```
+Error: no policy provided: set PolicyYAML, PolicyPath, or FARAMESH_POLICY env var
+```
+
+**Solution:** Set `FARAMESH_POLICY` environment variable or pass `policy_yaml=`.
+
+### DPR write errors
+
+**Error:**
+
+```
+Error: open /tmp/faramesh-dpr.db: read-only file system
+```
+
+**Solution:** `/tmp` is the only writable path in Lambda. Ensure `dpr_path='/tmp/faramesh-dpr.db'`.
+
+### High cold-start latency
+
+**Solution:** Disable DPR and use Horizon sync:
+
+```python
+guard = Guard(
+    policy_yaml=os.environ['FARAMESH_POLICY'],
+    dpr_path='',  # Disable local DPR
+)
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Python SDK" icon="python" href="/guides/python-sdk">
+    Use govern() decorator in non-serverless environments
+  </Card>
+  <Card title="Policy Language" icon="file-code" href="/policy/writing-policies">
+    Write expressive policy rules
+  </Card>
+  <Card title="Daemon Mode" icon="server" href="/guides/daemon-mode">
+    Run persistent daemon for long-lived services
+  </Card>
+  <Card title="MCP Gateway" icon="network-wired" href="/guides/mcp-gateway">
+    Govern MCP-compatible agents
+  </Card>
+</CardGroup>

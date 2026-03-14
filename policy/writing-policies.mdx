@@ -1,0 +1,352 @@
+---
+title: Writing Policies
+description: Learn how to write Faramesh policies for AI agent governance
+---
+
+Faramesh policies are YAML files written in the **Faramesh Policy Language (FPL)** v1.0. Policies define what actions your AI agents are allowed to perform, which require human approval, and which should be blocked entirely.
+
+## Policy Structure
+
+A complete policy file includes these top-level sections:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: demo-agent
+default_effect: permit
+
+vars:
+  max_refund: 500
+  max_email_recipients: 50
+
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial]
+
+rules:
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds threshold and requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+```
+
+### Core Sections
+
+<ParamField path="faramesh-version" type="string" required>
+  Policy language version. Always `"1.0"` for current FPL.
+</ParamField>
+
+<ParamField path="agent-id" type="string" required>
+  Unique identifier for the agent this policy governs.
+</ParamField>
+
+<ParamField path="default_effect" type="string" default="deny">
+  Fallback effect when no rule matches. Valid values: `permit`, `deny`, `defer`.
+</ParamField>
+
+<ParamField path="vars" type="object">
+  Policy variables accessible in rule conditions via `vars["key"]`. Use these for thresholds, allowed domains, or any configuration value.
+</ParamField>
+
+<ParamField path="tools" type="object">
+  Tool metadata declarations. Each tool can specify reversibility, blast radius, safety properties, and tags.
+</ParamField>
+
+<ParamField path="rules" type="array" required>
+  Ordered list of governance rules. Rules are evaluated top-to-bottom; first match wins.
+</ParamField>
+
+## Rule Anatomy
+
+Each rule defines a condition and the governance action to take:
+
+```yaml
+- id: deny-destructive-shell
+  match:
+    tool: shell/run
+    when: 'args["cmd"] matches "rm\\s+-[rf]" || args["cmd"] matches "mkfs"'
+  effect: deny
+  reason: destructive shell command blocked by policy
+  reason_code: DESTRUCTIVE_SHELL_COMMAND
+  incident_category: destructive_command
+  incident_severity: critical
+```
+
+<ParamField path="id" type="string" required>
+  Unique identifier for the rule. Appears in audit logs and decision responses.
+</ParamField>
+
+<ParamField path="match" type="object" required>
+  Defines when this rule applies.
+  
+  - **`tool`**: Glob pattern matching tool ID (e.g., `"stripe/*"`, `"shell/run"`, `"*"`)
+  - **`when`**: Optional expr-lang condition evaluated against call context
+</ParamField>
+
+<ParamField path="effect" type="string" required>
+  Governance decision if the rule matches. Valid values:
+  
+  - **`permit`**: Allow the action to proceed
+  - **`deny`**: Block the action immediately
+  - **`defer`**: Require human approval before proceeding
+</ParamField>
+
+<ParamField path="reason" type="string" required>
+  Human-readable explanation of why this decision was made. Shown to operators and end users.
+</ParamField>
+
+<ParamField path="reason_code" type="string">
+  Machine-readable code for the decision (e.g., `HIGH_VALUE_REFUND`, `DESTRUCTIVE_SHELL_COMMAND`). Used for analytics and alerting.
+</ParamField>
+
+<ParamField path="incident_category" type="string">
+  Category for incident tracking (e.g., `financial_threshold`, `destructive_command`, `mass_operation`).
+</ParamField>
+
+<ParamField path="incident_severity" type="string">
+  Severity level for incidents: `low`, `medium`, `high`, `critical`.
+</ParamField>
+
+## Best Practices
+
+<Steps>
+  <Step title="Start with Default Deny">
+    Set `default_effect: deny` and explicitly permit safe operations. This is the security-first approach.
+    
+    ```yaml
+    default_effect: deny
+    rules:
+      - id: allow-http-get
+        match:
+          tool: http/get
+        effect: permit
+        reason: Safe read-only HTTP GET
+    ```
+  </Step>
+  
+  <Step title="Order Rules by Specificity">
+    Put specific rules before general ones. First-match-wins means order matters.
+    
+    ```yaml
+    rules:
+      # Specific high-value refund rule first
+      - id: defer-high-value-refund
+        match:
+          tool: stripe/refund
+          when: 'args["amount"] > 500'
+        effect: defer
+      
+      # General refund permit second
+      - id: permit-normal-refund
+        match:
+          tool: stripe/refund
+        effect: permit
+    ```
+  </Step>
+  
+  <Step title="Use Variables for Thresholds">
+    Extract magic numbers into the `vars` section for maintainability.
+    
+    ```yaml
+    vars:
+      max_refund: 500
+      max_email_recipients: 50
+      allowed_domains:
+        - internal.example.com
+        - api.company.com
+    
+    rules:
+      - id: defer-high-value-refund
+        match:
+          tool: stripe/refund
+          when: 'args["amount"] > vars["max_refund"]'
+        effect: defer
+    ```
+  </Step>
+  
+  <Step title="Declare Tool Metadata">
+    Use the `tools` section to document risk properties. These are available in rule conditions.
+    
+    ```yaml
+    tools:
+      stripe/refund:
+        reversibility: compensatable
+        blast_radius: external
+        shadow_safe: false
+        tags: [financial]
+      shell/run:
+        reversibility: irreversible
+        blast_radius: local
+        shadow_safe: false
+        tags: [system]
+    ```
+  </Step>
+  
+  <Step title="Write Descriptive Reason Messages">
+    Reason strings appear in audit logs, approval UIs, and user notifications. Be clear about *why* the decision was made.
+    
+    ```yaml
+    # Good
+    reason: refund exceeds $500 threshold and requires finance approval
+    
+    # Bad
+    reason: denied
+    ```
+  </Step>
+</Steps>
+
+## Testing Policies
+
+Before deploying a policy, test it locally using the `faramesh policy test` command:
+
+```bash
+faramesh policy test policies/demo.yaml \
+  --tool stripe/refund \
+  --args '{"amount":600}'
+```
+
+**Output:**
+```
+  Tool:    stripe/refund
+  Effect:  defer
+  Rule:    defer-high-value-refund
+  Reason:  refund exceeds threshold and requires finance approval
+  Code:    HIGH_VALUE_REFUND
+```
+
+Test multiple scenarios to ensure your rules behave as expected:
+
+<CodeGroup>
+```bash High-value refund (deferred)
+faramesh policy test policies/demo.yaml \
+  --tool stripe/refund \
+  --args '{"amount":600}'
+```
+
+```bash Normal refund (permitted)
+faramesh policy test policies/demo.yaml \
+  --tool stripe/refund \
+  --args '{"amount":100}'
+```
+
+```bash Destructive shell (denied)
+faramesh policy test policies/demo.yaml \
+  --tool shell/run \
+  --args '{"cmd":"rm -rf /data"}'
+```
+</CodeGroup>
+
+<Note>
+  The `faramesh policy test` command runs a dry-run evaluation without a running daemon. It's perfect for policy authoring, CI validation, and demos.
+</Note>
+
+## Policy Variables in Conditions
+
+Policy conditions can access these variables:
+
+| Variable | Description | Example |
+|----------|-------------|--------|
+| `args` | Tool call arguments | `args["amount"]`, `args["cmd"]` |
+| `vars` | Policy variables | `vars["max_refund"]` |
+| `session.call_count` | Number of calls in session | `session.call_count > 100` |
+| `tool.reversibility` | Tool reversibility property | `tool.reversibility == "irreversible"` |
+| `tool.blast_radius` | Tool blast radius | `tool.blast_radius == "external"` |
+| `tool.tags` | Tool tags | `contains(tool.tags, "financial")` |
+
+See [Policy Syntax](/policy/policy-syntax) for complete details.
+
+## Real-World Example
+
+Here's a production-ready policy for a payment processing agent:
+
+```yaml
+faramesh-version: '1.0'
+agent-id: payment-processor
+default_effect: deny
+
+vars:
+  max_auto_refund: 500
+  max_daily_refunds: 10000
+  finance_team_slack: "#finance-approvals"
+
+tools:
+  stripe/refund:
+    reversibility: compensatable
+    blast_radius: external
+    shadow_safe: false
+    tags: [financial, customer_facing]
+    cost_usd: 0.25
+  stripe/get_charge:
+    reversibility: read_only
+    blast_radius: none
+    shadow_safe: true
+    tags: [financial]
+
+budget:
+  daily_usd: 100.00
+  max_calls: 1000
+  on_exceed: deny
+
+rules:
+  # Allow read-only charge lookups
+  - id: permit-charge-lookup
+    match:
+      tool: stripe/get_charge
+    effect: permit
+    reason: read-only charge lookup
+  
+  # Defer high-value refunds for approval
+  - id: defer-high-value-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] > vars["max_auto_refund"]'
+    effect: defer
+    reason: refund exceeds $500 threshold and requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+    incident_category: financial_threshold
+    incident_severity: high
+  
+  # Check daily refund budget
+  - id: defer-daily-limit
+    match:
+      tool: stripe/refund
+      when: 'session.daily_cost_usd + args["amount"] > vars["max_daily_refunds"]'
+    effect: defer
+    reason: daily refund budget would be exceeded
+    reason_code: DAILY_REFUND_LIMIT
+  
+  # Auto-approve small refunds
+  - id: permit-small-refund
+    match:
+      tool: stripe/refund
+      when: 'args["amount"] <= vars["max_auto_refund"]'
+    effect: permit
+    reason: refund within authorized threshold
+    reason_code: WITHIN_THRESHOLD
+```
+
+<Warning>
+  Always validate your policies with `faramesh policy validate` before deployment. Invalid policies will prevent your agent from starting.
+</Warning>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Policy Syntax" icon="code" href="/policy/policy-syntax">
+    Deep dive into YAML schema and expr-lang conditions
+  </Card>
+  <Card title="Rule Evaluation" icon="list-check" href="/policy/rule-evaluation">
+    Understand first-match-wins semantics and performance
+  </Card>
+  <Card title="Validation" icon="shield-check" href="/policy/validation">
+    Validate policies in CI and catch errors early
+  </Card>
+  <Card title="Examples" icon="books" href="/policy/examples">
+    Real-world policy examples and patterns
+  </Card>
+</CardGroup>

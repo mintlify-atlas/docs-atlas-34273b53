@@ -1,0 +1,603 @@
+---
+title: MCP Gateway
+description: Govern Model Context Protocol (MCP) agents — transparent tool call interception for Claude Desktop, Cursor, and any MCP client
+---
+
+The MCP Gateway (Adapter A5) intercepts tool calls from MCP-compatible clients (Claude Desktop, Cursor, any MCP client) **before** they reach the actual MCP tool servers. It acts as a transparent governance proxy: every tool invocation is authorized by Faramesh before execution.
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  MCP Client (Claude Desktop, Cursor, etc.)                   │
+│                                                              │
+│  User: "Refund $10,000 to customer"                         │
+│  LLM → tools/call → stripe_refund(amount=10000)             │
+└─────────────────────┬────────────────────────────────────────┘
+                      │ JSON-RPC 2.0 (stdio or HTTP)
+                      │
+                      ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Faramesh MCP Gateway                                        │
+│                                                              │
+│  1. Intercept tools/call message                            │
+│  2. Evaluate: Pipeline → Policy → Decision                  │
+│  3. If PERMIT: Forward to real MCP server                   │
+│  4. If DENY: Return MCP error to client                     │
+│  5. If DEFER: Return "pending approval" response            │
+└─────────────────────┬────────────────────────────────────────┘
+                      │
+                      ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Real MCP Server (tools implementation)                     │
+│                                                              │
+│  stripe_refund(amount, currency) → Stripe API               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Key insight:** The client talks to Faramesh as if it were the real MCP server. Faramesh forwards permitted calls to the real server and blocks/defers unauthorized ones.
+
+## MCP Protocol Primer
+
+[Model Context Protocol (MCP)](https://modelcontextprotocol.io) is an open standard for connecting LLM applications to external data sources and tools. It uses JSON-RPC 2.0 over stdio (standard input/output) or HTTP.
+
+**Key messages:**
+
+- `initialize` — Client handshake with server
+- `tools/list` — Request available tools
+- `tools/call` — Invoke a tool (this is where Faramesh intercepts)
+
+**Faramesh intercepts only `tools/call`. All other messages pass through unchanged.**
+
+## Quick Start (stdio mode)
+
+### 1. Install Faramesh
+
+```bash
+brew install faramesh/tap/faramesh
+# or: curl -fsSL https://raw.githubusercontent.com/faramesh/faramesh-core/main/install.sh | sh
+```
+
+### 2. Wrap Your MCP Server
+
+Instead of running your MCP server directly:
+
+```bash
+# Before (no governance)
+node mcp-server.js
+```
+
+Wrap it with Faramesh:
+
+```bash
+# After (governed)
+faramesh mcp wrap --policy policy.yaml -- node mcp-server.js
+```
+
+### 3. Configure Your MCP Client
+
+Update your MCP client config to use the wrapped command:
+
+<Tabs>
+  <Tab title="Claude Desktop">
+    ```json ~/Library/Application\ Support/Claude/claude_desktop_config.json
+    {
+      "mcpServers": {
+        "stripe": {
+          "command": "faramesh",
+          "args": [
+            "mcp",
+            "wrap",
+            "--policy",
+            "/Users/YOU/.faramesh/policy.yaml",
+            "--",
+            "node",
+            "/Users/YOU/mcp-servers/stripe/index.js"
+          ]
+        }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="Cursor">
+    ```json ~/.cursor/mcp.json
+    {
+      "servers": {
+        "stripe": {
+          "command": "faramesh",
+          "args": [
+            "mcp",
+            "wrap",
+            "--policy",
+            "/Users/YOU/.faramesh/policy.yaml",
+            "--",
+            "node",
+            "/Users/YOU/mcp-servers/stripe/index.js"
+          ]
+        }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="Generic MCP Client">
+    ```bash
+    # Any MCP client that uses stdio transport
+    faramesh mcp wrap --policy policy.yaml -- python mcp_server.py
+    ```
+  </Tab>
+</Tabs>
+
+### 4. Test
+
+Ask Claude/Cursor to invoke a tool:
+
+```
+User: Refund $10,000 to customer cust_abc123
+```
+
+Claude calls `stripe_refund(amount=10000, customer="cust_abc123")` → Faramesh intercepts → Policy evaluates → DEFER (requires approval).
+
+**Faramesh returns:**
+
+```json
+{
+  "status": "pending_approval",
+  "defer_token": "abc12345",
+  "message": "Tool call requires human approval. Token: abc12345"
+}
+```
+
+**Approve:**
+
+```bash
+faramesh agent approve abc12345
+```
+
+Claude retries → Faramesh approves → Forwards to real MCP server → Refund executes.
+
+## CLI Reference
+
+### `faramesh mcp wrap`
+
+Wrap an MCP server (stdio transport) with governance.
+
+```bash
+faramesh mcp wrap --policy policy.yaml -- <command> [args...]
+```
+
+**Options:**
+
+- `--policy` — Path to policy YAML file (required)
+- `--agent-id` — Agent identity (default: `"mcp-agent"`)
+- `--data-dir` — Directory for DPR store (default: `$TMPDIR/faramesh`)
+
+**Examples:**
+
+```bash
+# Node.js MCP server
+faramesh mcp wrap --policy policy.yaml -- node mcp-server.js
+
+# Python MCP server
+faramesh mcp wrap --policy policy.yaml -- python mcp_server.py
+
+# Custom agent ID
+faramesh mcp wrap --policy payment.yaml --agent-id payment-mcp -- node server.js
+```
+
+### `faramesh mcp proxy`
+
+Run an HTTP proxy for MCP-over-HTTP servers.
+
+```bash
+faramesh mcp proxy --policy policy.yaml --listen :8090 --target http://localhost:3000
+```
+
+**Options:**
+
+- `--policy` — Path to policy YAML file (required)
+- `--listen` — Address to listen on (default: `:8090`)
+- `--target` — Target MCP server URL (required)
+- `--agent-id` — Agent identity (default: `"mcp-agent"`)
+
+**Example:**
+
+```bash
+# Real MCP server runs on :3000
+node mcp-server.js  # Listening on http://localhost:3000
+
+# Faramesh proxy runs on :8090
+faramesh mcp proxy --policy policy.yaml --listen :8090 --target http://localhost:3000
+
+# Configure client to use http://localhost:8090
+```
+
+## Policy Example for MCP Tools
+
+```yaml policy.yaml
+faramesh-version: '1.0'
+agent-id: mcp-gateway
+default_effect: permit
+
+vars:
+  max_refund: 500
+  max_db_results: 100
+
+rules:
+  # Deny destructive shell commands
+  - id: deny-destructive-shell
+    match:
+      tool: shell_exec
+      when: 'args["command"] matches "rm\\s+-[rf]" || args["command"] matches "DROP TABLE"'
+    effect: deny
+    reason: destructive command blocked by policy
+    reason_code: DESTRUCTIVE_COMMAND
+
+  # Require approval for high-value refunds
+  - id: defer-high-value-refund
+    match:
+      tool: stripe_refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds $500 threshold — requires finance approval
+    reason_code: HIGH_VALUE_REFUND
+
+  # Deny large database queries
+  - id: deny-large-query
+    match:
+      tool: database_query
+      when: 'args["limit"] > vars["max_db_results"]'
+    effect: deny
+    reason: query limit exceeds max allowed results
+    reason_code: QUERY_LIMIT_EXCEEDED
+
+  # Allow all other tools
+  - id: permit-safe-tools
+    match:
+      tool: '*'
+    effect: permit
+```
+
+## Tool Metadata Preservation
+
+Faramesh passes through all MCP messages except `tools/call`.
+
+**Messages that pass through unchanged:**
+
+- `initialize` — Client handshake
+- `tools/list` — Request available tools
+- `resources/list` — Request available resources
+- `prompts/list` — Request available prompts
+
+This means:
+- Tool names, descriptions, and schemas are unchanged
+- Client sees the real MCP server's capabilities
+- Only **invocations** are governed
+
+## DEFER Workflow with MCP
+
+MCP clients don't natively support DEFER, so Faramesh returns a special response:
+
+### DEFER Response Format
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 123,
+  "result": {
+    "status": "pending_approval",
+    "defer_token": "abc12345",
+    "reason": "refund exceeds threshold",
+    "message": "Tool call requires human approval. Token: abc12345"
+  }
+}
+```
+
+### Approval Flow
+
+<Steps>
+
+<Step title="Client invokes tool">
+Claude: `stripe_refund(amount=10000)`
+</Step>
+
+<Step title="Faramesh intercepts and defers">
+Policy evaluates → DEFER → Returns `pending_approval` response.
+</Step>
+
+<Step title="Notify approver">
+Faramesh can send a Slack notification:
+
+```bash
+faramesh mcp wrap --policy policy.yaml --slack-webhook https://hooks.slack.com/... -- node server.js
+```
+</Step>
+
+<Step title="Approve">
+```bash
+faramesh agent approve abc12345
+```
+</Step>
+
+<Step title="Client retries">
+Claude retries the same tool call → Faramesh approves → Forwards to real server.
+</Step>
+
+</Steps>
+
+<Note>
+Most MCP clients (including Claude Desktop) will display the "pending approval" message to the user. The user can then manually retry after approval.
+</Note>
+
+## HTTP Proxy Mode
+
+For MCP servers that use HTTP transport instead of stdio:
+
+### Start Proxy
+
+```bash
+# Real MCP server
+node mcp-server.js  # Listening on http://localhost:3000
+
+# Faramesh proxy
+faramesh mcp proxy --policy policy.yaml --listen :8090 --target http://localhost:3000
+```
+
+### Configure Client
+
+Point your MCP client to the proxy URL instead of the real server:
+
+```json
+{
+  "mcpServers": {
+    "stripe": {
+      "url": "http://localhost:8090"
+    }
+  }
+}
+```
+
+### How It Works
+
+```
+MCP Client → http://localhost:8090 (Faramesh proxy)
+             → Governance decision
+             → http://localhost:3000 (Real MCP server)
+             → Response
+             ← http://localhost:8090
+MCP Client ← Response
+```
+
+## Monitoring and Audit
+
+### Live Audit Stream
+
+```bash
+faramesh audit tail --agent mcp-gateway
+```
+
+**Output:**
+
+```
+[10:15:23] PERMIT  stripe_refund          mcp-gateway        amount=100  latency=8ms
+[10:15:25] DENY    shell_exec             mcp-gateway        rule=deny-destructive-shell  latency=2ms
+[10:15:27] DEFER   stripe_refund          mcp-gateway        amount=10000  rule=defer-high-value  latency=5ms
+```
+
+### DPR Chain
+
+All MCP tool calls are recorded in the DPR chain:
+
+```bash
+faramesh audit verify ~/.faramesh/faramesh.db
+```
+
+**Output:**
+
+```
+✓ Chain integrity verified. 1247 records, 0 violations.
+```
+
+## Example: Claude Desktop + Stripe MCP Server
+
+### 1. Install Stripe MCP Server
+
+```bash
+npm install -g @modelcontextprotocol/server-stripe
+```
+
+### 2. Create Policy
+
+```yaml ~/.faramesh/stripe-policy.yaml
+faramesh-version: '1.0'
+agent-id: claude-stripe
+default_effect: permit
+
+vars:
+  max_refund: 500
+
+rules:
+  - id: defer-high-value-refund
+    match:
+      tool: stripe_refund
+      when: 'args["amount"] > vars["max_refund"]'
+    effect: defer
+    reason: refund exceeds $500 — requires approval
+    reason_code: HIGH_VALUE_REFUND
+```
+
+### 3. Configure Claude Desktop
+
+```json ~/Library/Application\ Support/Claude/claude_desktop_config.json
+{
+  "mcpServers": {
+    "stripe": {
+      "command": "faramesh",
+      "args": [
+        "mcp",
+        "wrap",
+        "--policy",
+        "/Users/YOU/.faramesh/stripe-policy.yaml",
+        "--agent-id",
+        "claude-stripe",
+        "--",
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-stripe"
+      ],
+      "env": {
+        "STRIPE_API_KEY": "sk_test_..."
+      }
+    }
+  }
+}
+```
+
+### 4. Test
+
+**In Claude Desktop:**
+
+```
+User: Refund $100 to customer cust_abc123
+```
+
+**Claude calls `stripe_refund(amount=100, customer="cust_abc123")` → PERMIT → Executes.**
+
+```
+User: Refund $10,000 to customer cust_abc123
+```
+
+**Claude calls `stripe_refund(amount=10000, customer="cust_abc123")` → DEFER → Returns:**
+
+```
+Tool call requires human approval. Token: abc12345
+```
+
+**Approve:**
+
+```bash
+faramesh agent approve abc12345
+```
+
+**Retry in Claude Desktop:**
+
+```
+User: Retry the refund
+```
+
+**Claude retries → PERMIT → Executes.**
+
+## Multiple MCP Servers
+
+You can govern multiple MCP servers with different policies:
+
+```json claude_desktop_config.json
+{
+  "mcpServers": {
+    "stripe": {
+      "command": "faramesh",
+      "args": ["mcp", "wrap", "--policy", "/path/to/stripe-policy.yaml", "--", "node", "stripe-server.js"]
+    },
+    "database": {
+      "command": "faramesh",
+      "args": ["mcp", "wrap", "--policy", "/path/to/db-policy.yaml", "--", "python", "db_server.py"]
+    },
+    "filesystem": {
+      "command": "faramesh",
+      "args": ["mcp", "wrap", "--policy", "/path/to/fs-policy.yaml", "--", "node", "fs-server.js"]
+    }
+  }
+}
+```
+
+Each server has its own policy, agent ID, and DPR chain.
+
+## Troubleshooting
+
+### Client can't connect to wrapped server
+
+**Error:**
+
+```
+MCP server startup failed: command not found
+```
+
+**Solution:** Ensure the wrapped command is in your `PATH` or use an absolute path:
+
+```json
+{
+  "command": "faramesh",
+  "args": ["mcp", "wrap", "--policy", "/path/to/policy.yaml", "--", "/usr/local/bin/node", "server.js"]
+}
+```
+
+### Policy not applied
+
+**Solution:** Verify the policy file path is correct and readable:
+
+```bash
+faramesh policy validate /path/to/policy.yaml
+```
+
+### DEFER not working
+
+**Problem:** Client doesn't retry after approval.
+
+**Solution:** DEFER in MCP requires manual retry. The client must re-invoke the tool after approval.
+
+## Best Practices
+
+<Steps>
+
+<Step title="Use descriptive agent IDs">
+```bash
+faramesh mcp wrap --policy policy.yaml --agent-id claude-stripe -- node server.js
+```
+
+Makes audit logs easier to filter:
+
+```bash
+faramesh audit tail --agent claude-stripe
+```
+</Step>
+
+<Step title="Separate policies per server">
+Don't use one policy for all MCP servers. Each server should have its own policy tailored to its tools:
+
+```
+~/.faramesh/
+  ├── stripe-policy.yaml
+  ├── database-policy.yaml
+  └── filesystem-policy.yaml
+```
+</Step>
+
+<Step title="Test policies before deploying">
+```bash
+faramesh policy test stripe-policy.yaml --tool stripe_refund --args '{"amount":10000}'
+```
+</Step>
+
+<Step title="Monitor with audit tail">
+```bash
+faramesh audit tail --agent mcp-gateway
+```
+</Step>
+
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Policy Language" icon="file-code" href="/policy/writing-policies">
+    Write expressive policy rules for MCP tools
+  </Card>
+  <Card title="CLI Usage" icon="terminal" href="/guides/cli-usage">
+    Approve DEFERs and stream audit logs
+  </Card>
+  <Card title="Python SDK" icon="python" href="/guides/python-sdk">
+    Govern non-MCP Python agents
+  </Card>
+  <Card title="DEFER Workflow" icon="clock" href="/concepts/defer-workflow">
+    Human-in-the-loop approvals
+  </Card>
+</CardGroup>

@@ -1,0 +1,602 @@
+---
+title: 'Adapters'
+description: 'The 6 adapter modes that connect agents to the invariant core'
+---
+
+## Overview
+
+Faramesh adapters are **thin translation layers** that normalize agent environments into `CanonicalActionRequest` (CAR) format and deliver them to the invariant core.
+
+<Note>
+All adapters deliver identical governance behavior — the core pipeline runs the same way regardless of which adapter is used.
+</Note>
+
+## The 6 Adapter Modes
+
+Faramesh provides 6 adapters, each optimized for a different deployment environment:
+
+<CardGroup cols={2}>
+  <Card title="A1: SDK Shim" icon="code">
+    Decorator pattern for Python/JS/Go/TypeScript. Under 60 seconds to first governance.
+  </Card>
+  
+  <Card title="A2: Local Daemon" icon="server">
+    Unix socket broker. Works everywhere, no network required.
+  </Card>
+  
+  <Card title="A3: Sidecar + Proxy" icon="network-wired">
+    Transparent HTTP/gRPC interception. Network-level isolation.
+  </Card>
+  
+  <Card title="A4: Serverless" icon="bolt">
+    Lambda layers, Cloud Run handlers. Zero infrastructure.
+  </Card>
+  
+  <Card title="A5: MCP Gateway" icon="gateway">
+    Faramesh IS the MCP server. One-line client config change.
+  </Card>
+  
+  <Card title="A6: eBPF (Optional)" icon="linux">
+    Kernel-level syscall interception on Linux.
+  </Card>
+</CardGroup>
+
+## A1: SDK Shim
+
+**Best for**: Jupyter notebooks, local dev, rapid prototyping
+
+### Python
+
+```python
+from faramesh import govern
+
+# Wrap any callable
+governed_refund = govern(stripe_refund, policy='payment.yaml', agent_id='payment-bot')
+
+try:
+    result = governed_refund(amount=100, currency='usd')
+except DenyError as e:
+    print(f"DENY: {e.reason}")
+except DeferredError as e:
+    print(f"DEFER: approve with: faramesh agent approve {e.defer_token}")
+```
+
+### JavaScript/TypeScript
+
+```typescript
+import { govern } from '@faramesh/sdk';
+
+const governedRefund = govern(stripeRefund, {
+  policy: 'payment.yaml',
+  agentId: 'payment-bot'
+});
+
+try {
+  const result = await governedRefund({ amount: 100, currency: 'usd' });
+} catch (e) {
+  if (e instanceof DenyError) {
+    console.log(`DENY: ${e.reason}`);
+  }
+}
+```
+
+### Go
+
+```go
+import "github.com/faramesh/faramesh-sdk-go"
+
+func main() {
+    governed := faramesh.Govern(stripeRefund, faramesh.Config{
+        Policy:  "payment.yaml",
+        AgentID: "payment-bot",
+    })
+    
+    result, err := governed(ctx, 100, "usd")
+    if err != nil {
+        if faramesh.IsDeny(err) {
+            log.Printf("DENY: %s", err)
+        }
+    }
+}
+```
+
+### How It Works
+
+<Steps>
+  <Step title="Auto-Start Daemon">
+    On first `govern()` call, SDK checks for daemon at `/tmp/faramesh.sock`.
+    
+    If not found → spawns `faramesh serve --policy <policy>` in background.
+  </Step>
+  
+  <Step title="Wrap Function">
+    `govern()` returns a wrapper that intercepts calls.
+  </Step>
+  
+  <Step title="Build CAR">
+    SDK constructs `CanonicalActionRequest`:
+    ```json
+    {
+      "call_id": "uuid-v4",
+      "agent_id": "payment-bot",
+      "session_id": "sess_abc123",
+      "tool_id": "stripe/refund",
+      "args": {"amount": 100, "currency": "usd"},
+      "timestamp": "2026-03-14T10:23:45Z",
+      "intercept_adapter": "sdk"
+    }
+    ```
+  </Step>
+  
+  <Step title="Send to Daemon">
+    POST to `unix:///tmp/faramesh.sock/v1/evaluate`
+  </Step>
+  
+  <Step title="Act on Decision">
+    - `PERMIT` → Execute wrapped function, return result
+    - `DENY` → Raise `DenyError`, never execute
+    - `DEFER` → Enter DeferPollLoop, wait for approval
+    - `SHADOW` → Execute and log, return result
+  </Step>
+</Steps>
+
+### Metadata Preservation
+
+SDK shims preserve:
+- Type hints (Python)
+- JSDoc (JavaScript/TypeScript)
+- LangChain `@tool` metadata
+- Pydantic models
+- Function signatures
+
+Example:
+```python
+from langchain.tools import tool
+from faramesh import govern
+
+@tool
+def stripe_refund(amount: float, currency: str) -> str:
+    """Refund a charge via Stripe."""
+    ...
+
+governed = govern(stripe_refund, policy='payment.yaml')
+# governed.name == 'stripe_refund'
+# governed.description == 'Refund a charge via Stripe.'
+# governed.args_schema == {'amount': float, 'currency': str}
+```
+
+## A2: Local Daemon
+
+**Best for**: Local development, CI/CD, environments without Kubernetes
+
+### Start Daemon
+
+```bash
+faramesh serve --policy payment.yaml
+```
+
+Output:
+```
+Faramesh daemon started
+Policy: payment.yaml (sha256:8f3a...)
+Listening: unix:///tmp/faramesh.sock
+Ready.
+```
+
+### Connect from Any Language
+
+The daemon exposes a JSON-over-Unix-socket API:
+
+```bash
+curl --unix-socket /tmp/faramesh.sock \
+  -X POST http://localhost/v1/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "call_id": "uuid-v4",
+    "agent_id": "payment-bot",
+    "tool_id": "stripe/refund",
+    "args": {"amount": 100, "currency": "usd"}
+  }'
+```
+
+Response:
+```json
+{
+  "effect": "PERMIT",
+  "rule_id": "permit-normal-refund",
+  "reason": "refund within authorized threshold",
+  "latency_ms": 0.123
+}
+```
+
+### Daemon Lifecycle
+
+The daemon:
+- Loads policy on startup
+- Watches policy file for changes (hot reload)
+- Opens WAL and SQLite store
+- Binds to Unix socket `/tmp/faramesh.sock`
+- Accepts connections from SDKs
+
+## A3: Sidecar + Proxy
+
+**Best for**: Kubernetes, production deployments, network isolation
+
+### Architecture
+
+```
+┌─────────────────────────────┐
+│  Application Pod             │
+│                              │
+│  ┌──────────┐  ┌──────────┐ │
+│  │  Agent   │  │ Faramesh │ │
+│  │ Container│→→│ Sidecar  │ │
+│  └──────────┘  └──────────┘ │
+│       ↓              ↓       │
+│  Intercepts     Evaluates   │
+│  HTTP/gRPC      Policy      │
+└─────────────────────────────┘
+         ↓
+    External API
+```
+
+The sidecar runs as a second container in the same pod and intercepts network traffic.
+
+### Helm Deployment
+
+```bash
+helm repo add faramesh https://charts.faramesh.dev
+helm install faramesh faramesh/faramesh \
+  --set policy.configMap=payment-policy \
+  --set sidecar.inject=auto
+```
+
+This:
+1. Deploys Faramesh sidecar injector (mutating webhook)
+2. Injects sidecar into pods with label `faramesh.dev/inject: "true"`
+3. Configures iptables to redirect traffic through sidecar
+4. Mounts policy from ConfigMap
+
+### Pod Annotation
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: payment-bot
+  labels:
+    faramesh.dev/inject: "true"
+  annotations:
+    faramesh.dev/policy: payment-policy
+    faramesh.dev/agent-id: payment-bot
+spec:
+  containers:
+  - name: agent
+    image: myorg/payment-bot:latest
+```
+
+### Transparent Interception
+
+The sidecar intercepts:
+- HTTP requests (via iptables + Envoy)
+- gRPC calls (via gRPC interceptor)
+- Tool calls to known APIs (Stripe, AWS, OpenAI)
+
+No code changes required — governance is **transparent**.
+
+## A4: Serverless
+
+**Best for**: AWS Lambda, Google Cloud Run, Azure Functions
+
+### AWS Lambda Layer
+
+```bash
+# Add Faramesh layer to your function
+aws lambda update-function-configuration \
+  --function-name payment-bot \
+  --layers arn:aws:lambda:us-east-1:123456789012:layer:faramesh:12
+```
+
+Set environment variables:
+```bash
+FARAMESH_POLICY=s3://my-bucket/payment.yaml
+FARAMESH_AGENT_ID=payment-bot
+```
+
+The layer:
+1. Loads policy from S3 on cold start
+2. Patches the Lambda runtime to intercept tool calls
+3. Writes DPR records to S3 (WAL-first still applies)
+
+### Google Cloud Run
+
+```dockerfile
+FROM gcr.io/cloudrun/faramesh:latest
+COPY payment.yaml /etc/faramesh/policy.yaml
+COPY agent.py /app/agent.py
+ENV FARAMESH_POLICY=/etc/faramesh/policy.yaml
+CMD ["python", "/app/agent.py"]
+```
+
+The Faramesh base image:
+- Starts daemon on container startup
+- Loads policy from `FARAMESH_POLICY`
+- Writes DPR to Cloud Storage
+
+### Serverless DPR Storage
+
+In serverless environments, DPR records are written to:
+- **AWS Lambda**: S3 (WAL) + DynamoDB (query index)
+- **Google Cloud Run**: Cloud Storage (WAL) + Firestore (query index)
+- **Azure Functions**: Blob Storage (WAL) + Cosmos DB (query index)
+
+The WAL-first invariant still applies — the Lambda/Cloud Run handler does not return until the S3/Cloud Storage write is confirmed.
+
+## A5: MCP Gateway
+
+**Best for**: Claude Desktop, MCP-compatible AI clients
+
+### What is MCP?
+
+[Model Context Protocol (MCP)](https://modelcontextprotocol.io/) is an open standard for connecting AI assistants to external tools. Faramesh can act as an MCP server with built-in governance.
+
+### Configuration
+
+In your MCP client config (e.g., Claude Desktop `config.json`):
+
+```json
+{
+  "mcpServers": {
+    "faramesh": {
+      "command": "faramesh",
+      "args": ["mcp", "--policy", "payment.yaml"]
+    }
+  }
+}
+```
+
+This starts Faramesh in MCP server mode. All tool calls from Claude Desktop flow through the policy engine.
+
+### How It Works
+
+<Steps>
+  <Step title="MCP Client Requests Tool List">
+    Claude Desktop sends `tools/list` request.
+  </Step>
+  
+  <Step title="Faramesh Returns Governed Tools">
+    Faramesh reads tool definitions from policy and returns them:
+    ```json
+    {
+      "tools": [
+        {"name": "stripe/refund", "description": "Refund a charge"},
+        {"name": "send_email", "description": "Send email"}
+      ]
+    }
+    ```
+  </Step>
+  
+  <Step title="MCP Client Calls Tool">
+    Claude calls `tools/call` with:
+    ```json
+    {"name": "stripe/refund", "arguments": {"amount": 100}}
+    ```
+  </Step>
+  
+  <Step title="Faramesh Evaluates Policy">
+    Converts MCP request → `CanonicalActionRequest` → runs pipeline.
+  </Step>
+  
+  <Step title="Return Decision">
+    - `PERMIT` → Execute tool, return result
+    - `DENY` → Return error to MCP client
+    - `DEFER` → Return "pending approval" message with token
+  </Step>
+</Steps>
+
+### DEFER in MCP
+
+When a tool is DEFERed, the MCP client sees:
+
+```json
+{
+  "error": {
+    "code": "DEFERRED",
+    "message": "Refund exceeds threshold — requires finance approval",
+    "data": {
+      "defer_token": "a3f5b2c8",
+      "expires_at": "2026-03-14T10:28:45Z"
+    }
+  }
+}
+```
+
+The user approves via:
+```bash
+faramesh agent approve a3f5b2c8
+```
+
+Then retries the tool call in Claude Desktop.
+
+## A6: eBPF (Optional)
+
+**Best for**: Linux production environments, maximum security, zero trust
+
+<Warning>
+eBPF adapter is **optional** and only available on Linux with kernel 5.8+. It requires root privileges to load eBPF programs.
+</Warning>
+
+### How It Works
+
+The eBPF adapter uses kernel-level syscall interception:
+
+<Steps>
+  <Step title="Load eBPF Program">
+    ```bash
+    sudo faramesh serve --policy payment.yaml --adapter ebpf
+    ```
+    
+    This loads eBPF programs that attach to syscalls: `connect`, `sendto`, `write`, `execve`.
+  </Step>
+  
+  <Step title="Intercept Syscalls">
+    When the agent process calls `connect()` to Stripe API:
+    ```c
+    connect(sock, stripe.com:443, ...)
+    ```
+    
+    The eBPF program intercepts it **before** the kernel completes the syscall.
+  </Step>
+  
+  <Step title="Extract Arguments">
+    eBPF program:
+    - Reads destination IP/hostname
+    - Reads HTTP method + path from socket buffer
+    - Extracts tool ID from request (e.g., `POST /v1/refunds`)
+  </Step>
+  
+  <Step title="Send to Userspace Daemon">
+    eBPF program sends event to userspace daemon via perf buffer.
+  </Step>
+  
+  <Step title="Evaluate Policy">
+    Daemon builds `CanonicalActionRequest` and evaluates policy.
+  </Step>
+  
+  <Step title="Enforce Decision">
+    - `PERMIT` → Allow syscall to proceed
+    - `DENY` → Return `EPERM` error to agent process (syscall fails)
+    - `DEFER` → Block syscall, poll for approval, resume on approval
+  </Step>
+</Steps>
+
+### Why eBPF?
+
+<CardGroup cols={2}>
+  <Card title="Zero Trust" icon="shield-halved">
+    Agent cannot bypass governance — enforcement happens in kernel.
+  </Card>
+  
+  <Card title="No Code Changes" icon="code-slash">
+    Works with any binary, any language. No SDK required.
+  </Card>
+  
+  <Card title="Syscall-Level Visibility" icon="eye">
+    See all network calls, file access, process spawns.
+  </Card>
+  
+  <Card title="Production Ready" icon="check">
+    Used in production by high-security environments.
+  </Card>
+</CardGroup>
+
+### Limitations
+
+- Linux only (kernel 5.8+)
+- Requires root / `CAP_BPF` capability
+- Higher performance overhead (~10-50μs per syscall)
+- Complex debugging (BPF programs are kernel code)
+
+## When to Use Each Adapter
+
+| Adapter | Use When... |
+|---------|-------------|
+| **A1: SDK Shim** | Jupyter notebook, local dev, rapid prototyping, Python/JS/Go/TS projects |
+| **A2: Local Daemon** | CI/CD, local servers, environments without Kubernetes |
+| **A3: Sidecar + Proxy** | Kubernetes production, network isolation, transparent interception |
+| **A4: Serverless** | AWS Lambda, Google Cloud Run, Azure Functions, event-driven architectures |
+| **A5: MCP Gateway** | Claude Desktop, MCP-compatible AI clients, desktop AI assistants |
+| **A6: eBPF** | High-security Linux environments, zero-trust enforcement, no code changes allowed |
+
+## Adapter Auto-Detection
+
+Run:
+```bash
+faramesh init --auto-detect
+```
+
+Faramesh inspects your environment and generates the appropriate config:
+
+<Accordion title="Kubernetes Detected">
+  ```bash
+  ✓ Kubernetes cluster detected
+  
+  Run:
+    helm repo add faramesh https://charts.faramesh.dev
+    helm install faramesh faramesh/faramesh --set policy.file=payment.yaml
+  
+  Annotate pods:
+    kubectl label pod payment-bot faramesh.dev/inject=true
+  ```
+</Accordion>
+
+<Accordion title="AWS Lambda Detected">
+  ```bash
+  ✓ AWS Lambda environment detected
+  
+  Add layer:
+    arn:aws:lambda:us-east-1:123456789012:layer:faramesh:12
+  
+  Set environment variables:
+    FARAMESH_POLICY=s3://my-bucket/payment.yaml
+    FARAMESH_AGENT_ID=payment-bot
+  ```
+</Accordion>
+
+<Accordion title="Jupyter Notebook Detected">
+  ```bash
+  ✓ Jupyter notebook detected
+  
+  Install SDK:
+    pip install faramesh
+  
+  Add to notebook:
+    from faramesh import govern
+    governed_fn = govern(my_function, policy='payment.yaml')
+  ```
+</Accordion>
+
+<Accordion title="MCP Client Detected">
+  ```bash
+  ✓ MCP client config found at ~/.config/claude/config.json
+  
+  Add to mcpServers:
+    {
+      "faramesh": {
+        "command": "faramesh",
+        "args": ["mcp", "--policy", "payment.yaml"]
+      }
+    }
+  ```
+</Accordion>
+
+## Adapter Independence
+
+A key benefit of the invariant core architecture: **you can swap adapters without changing policies**.
+
+Example: Develop with SDK (A1), deploy to Kubernetes with sidecar (A3):
+
+```bash
+# Development (A1)
+pip install faramesh
+python agent.py  # Uses govern() decorator
+
+# Production (A3)
+helm install faramesh faramesh/faramesh
+kubectl label pod agent faramesh.dev/inject=true
+# SAME policy.yaml, SAME governance behavior
+```
+
+No policy changes. No agent code changes. Only the adapter changes.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Understand the invariant core that powers all adapters.
+  </Card>
+  
+  <Card title="Policy Engine" icon="file-code" href="/concepts/policy-engine">
+    Write policies that work across all adapters.
+  </Card>
+</CardGroup>
